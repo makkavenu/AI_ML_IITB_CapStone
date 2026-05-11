@@ -34,7 +34,7 @@ _SYSTEM_PROMPT = (
     "  • vision_llm    — analyses images and answers questions (Qwen3-VL-2B)\n"
     "  • object_detection — detects and localises objects in images (YOLOv12-S)\n\n"
     "Always select the most appropriate tool for the user's request.\n"
-    "If an image is provided, prefer vision_llm for descriptive questions or "
+    "If an image is provided, must use vision_llm tool for descriptive questions over directly using gpt4o or "
     "object_detection when the user wants to know what objects are present."
 )
 
