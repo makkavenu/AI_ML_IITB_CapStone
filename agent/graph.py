@@ -123,11 +123,19 @@ async def tool_executor_node(state: AgentState) -> dict:
         tool_args: dict = dict(tool_call["args"])
         tool_used = tool_name
 
-        # Inject image from state for vision / detection tools when the LLM
-        # did not forward it (the image is in the message content, not in args).
+        # GPT-4o cannot pass large binary data in tool call arguments — it either
+        # omits image_base64 entirely or substitutes a short placeholder string
+        # (e.g. "<base64+encoded+image>"). Always inject the real bytes from
+        # state for any vision / detection tool.
         vision_tools = {"vision_llm", "object_detection"}
-        if tool_name in vision_tools and not tool_args.get("image_base64"):
-            tool_args["image_base64"] = state.get("image_base64") or ""
+        if tool_name in vision_tools:
+            real_image = state.get("image_base64") or ""
+            if real_image:
+                tool_args["image_base64"] = real_image
+                logger.info(
+                    "tool_executor_node | injected image_base64 from state (len=%d)",
+                    len(real_image),
+                )
 
         logger.info("tool_executor_node | tool=%s args_keys=%s", tool_name, list(tool_args.keys()))
 
