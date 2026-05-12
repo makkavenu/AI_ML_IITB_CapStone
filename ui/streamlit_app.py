@@ -109,7 +109,8 @@ def _render_message(msg: dict) -> None:
 
     Args:
         msg: Dict with keys ``role``, ``content``, and optionally
-            ``tool_used`` and ``guardrail_flagged``.
+            ``tool_used``, ``guardrail_flagged``, and
+            ``annotated_image_base64``.
     """
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -119,6 +120,10 @@ def _render_message(msg: dict) -> None:
             st.caption(f"{icon} Tool used: `{tool}`")
         if msg.get("guardrail_flagged"):
             st.warning("⚠️ Guardrail flagged this response.")
+        annotated = msg.get("annotated_image_base64")
+        if annotated:
+            ann_bytes = base64.b64decode(annotated)
+            st.image(ann_bytes, caption="Detected Objects", use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -202,12 +207,17 @@ def main() -> None:
                 tool_used: str = result.get("tool_used", "")
                 guardrail_flagged: bool = result.get("guardrail_flagged", False)
 
+                annotated_b64: Optional[str] = result.get("annotated_image_base64")
+
                 st.markdown(response_text)
                 if tool_used:
                     icon = _TOOL_ICONS.get(tool_used, "🔧")
                     st.caption(f"{icon} Tool used: `{tool_used}`")
                 if guardrail_flagged:
                     st.warning("⚠️ Guardrail flagged this response.")
+                if annotated_b64:
+                    ann_bytes = base64.b64decode(annotated_b64)
+                    st.image(ann_bytes, caption="Detected Objects", use_container_width=True)
 
                 st.session_state.messages.append(
                     {
@@ -215,6 +225,7 @@ def main() -> None:
                         "content": response_text,
                         "tool_used": tool_used,
                         "guardrail_flagged": guardrail_flagged,
+                        "annotated_image_base64": annotated_b64,
                     }
                 )
 

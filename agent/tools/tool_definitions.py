@@ -16,11 +16,15 @@ Endpoint base URLs are read from environment variables so the same image
 works locally and in Docker / EC2 without code changes.
 """
 
+import base64 as _base64
+import io
+import json
 import logging
 import os
 
 import httpx
 from langchain_core.tools import tool
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +41,12 @@ _QWEN_VL_URL: str = os.getenv(
 ).rstrip("/") + "/v1/chat/completions"
 
 _YOLOV12_URL: str = os.getenv(
-    "YOLOV12_ENDPOINT_URL", "http://localhost:9003"
-).rstrip("/") + "/v1/detect"
+    "YOLOV12_ENDPOINT_URL", "http://137.74.88.197:8002"
+).rstrip("/") + "/predict"
 
 _HTTP_TIMEOUT: int = int(os.getenv("TOOL_HTTP_TIMEOUT", "60"))
+# Max pixel dimension sent to the YOLO server — keeps memory usage predictable.
+_YOLO_MAX_DIM: int = int(os.getenv("YOLO_MAX_DIM", "640"))
 
 
 # ---------------------------------------------------------------------------
@@ -201,28 +207,127 @@ async def vision_llm(query: str, image_base64: str = "") -> str:
 
 @tool
 async def object_detection(image_base64: str = "") -> str:
-    """Detect and localise objects in an image using the YOLOv12-S model.
+    """Detect and localise objects in an image using the YOLOv8 model.
+
+    Calls the YOLOv8 inference endpoint at ``YOLOV12_ENDPOINT_URL``
+    (default: ``http://137.74.88.197:8002``) via a multipart file upload.
+    Returns a JSON string containing the detection list and a human-readable
+    summary so the synthesiser can describe results and the API layer can
+    draw bounding boxes onto the original image.
 
     Args:
-        image_base64: Base64-encoded image data (JPEG/PNG).
+        image_base64: Base64-encoded image data (JPEG/PNG/WebP).
 
     Returns:
-        A string listing detected objects with bounding boxes and confidence
-        scores from the YOLOv12-S endpoint.
+        JSON string with keys ``summary`` (str), ``detections`` (list),
+        ``count`` (int), ``image_width`` (int), ``image_height`` (int).
+
+    Raises:
+        httpx.HTTPStatusError: On 4xx / 5xx responses from the model server.
+        httpx.TimeoutException: When the model server does not respond in time.
     """
-    logger.info("object_detection called | image_provided=%s", bool(image_base64))
-    # TODO: Replace with real HTTP call once YOLOv12-S endpoint is deployed.
-    # The endpoint is expected to accept {"image": "<base64>"} and return
-    # {"detections": [{"label": ..., "confidence": ..., "bbox": [...]}]}
-    # Example:
-    #   async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-    #       resp = await client.post(_YOLOV12_URL, json={"image": image_base64})
-    #       resp.raise_for_status()
-    #   return str(resp.json()["detections"])
-    return (
-        "[STUB — YOLOv12-S] Object detection endpoint not yet deployed. "
-        f"Set YOLOV12_ENDPOINT_URL (currently: {_YOLOV12_URL}) and replace this stub."
-    )
+    logger.info("object_detection called | url=%s image_provided=%s", _YOLOV12_URL, bool(image_base64))
+
+    if not image_base64:
+        return json.dumps({
+            "summary": "No image was provided. Please attach an image to run object detection.",
+            "detections": [],
+            "count": 0,
+            "image_width": 0,
+            "image_height": 0,
+        })
+
+    try:
+        # Remove data-URI prefix if present (e.g. "data:image/jpeg;base64,...")
+        raw = image_base64.split(",", 1)[-1]
+        # Remove ALL whitespace — b64decode silently ignores spaces/newlines
+        # and produces garbage bytes rather than raising an error.
+        raw = "".join(raw.split())
+        # Normalise URL-safe base64 chars (- → +, _ → /) to standard alphabet
+        raw = raw.replace("-", "+").replace("_", "/")
+        # Restore any stripped padding
+        raw += "=" * (-len(raw) % 4)
+        logger.info(
+            "object_detection | base64 len=%d first30=%r", len(raw), raw[:30]
+        )
+        img_bytes = _base64.b64decode(raw, validate=True)
+    except Exception:
+        logger.exception("object_detection | failed to decode base64 image")
+        return json.dumps({"summary": "Invalid image data.", "detections": [], "count": 0,
+                           "image_width": 0, "image_height": 0})
+
+    # Resize to _YOLO_MAX_DIM to avoid OOM on the inference server
+    try:
+        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        orig_w, orig_h = pil_img.size
+        if max(orig_w, orig_h) > _YOLO_MAX_DIM:
+            scale = _YOLO_MAX_DIM / max(orig_w, orig_h)
+            new_size = (int(orig_w * scale), int(orig_h * scale))
+            pil_img = pil_img.resize(new_size, Image.LANCZOS)
+            logger.info(
+                "object_detection | resized %dx%d -> %dx%d (max_dim=%d)",
+                orig_w, orig_h, new_size[0], new_size[1], _YOLO_MAX_DIM,
+            )
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=90)
+        img_bytes = buf.getvalue()
+    except Exception:
+        logger.exception("object_detection | resize failed — sending original bytes")
+
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            resp = await client.post(
+                _YOLOV12_URL,
+                files={"file": ("image.jpg", img_bytes, "image/jpeg")},
+            )
+            resp.raise_for_status()
+        data = resp.json()
+
+        detections: list[dict] = data.get("detections", [])
+        count: int = data.get("count", len(detections))
+
+        if not detections:
+            summary = "No objects were detected in the image."
+        else:
+            parts = [f"{d['class_name']} ({d['confidence']:.0%})" for d in detections]
+            summary = f"Detected {count} object(s): {', '.join(parts)}."
+
+        logger.info("object_detection | count=%d detections=%s", count,
+                    [d['class_name'] for d in detections])
+        return json.dumps({
+            "summary": summary,
+            "detections": detections,
+            "count": count,
+            "image_width": data.get("image_width", 0),
+            "image_height": data.get("image_height", 0),
+        })
+
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "object_detection | HTTP %s from %s: %s",
+            exc.response.status_code,
+            _YOLOV12_URL,
+            exc.response.text[:400],
+        )
+        return json.dumps({
+            "summary": (
+                f"Object detection failed (server returned HTTP {exc.response.status_code}). "
+                "The inference server encountered an error processing the image."
+            ),
+            "detections": [],
+            "count": 0,
+            "image_width": 0,
+            "image_height": 0,
+        })
+    except httpx.TimeoutException:
+        logger.error("object_detection | request timed out after %ds", _HTTP_TIMEOUT)
+        return json.dumps({
+            "summary": f"Object detection timed out after {_HTTP_TIMEOUT}s. Try again.",
+            "detections": [],
+            "count": 0,
+            "image_width": 0,
+            "image_height": 0,
+        })
 
 
 # ---------------------------------------------------------------------------
