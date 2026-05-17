@@ -16,7 +16,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from PIL import Image, ImageDraw
 from pydantic import BaseModel
 
@@ -32,8 +32,7 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = (
-    "You are a multi-modal AI assistant. You MUST route every user request "
-    "to exactly one of these four tools — do not answer directly:\n"
+    "You are a multi-modal AI assistant with access to four tools:\n"
     "  • medical_qa        — medical / health / clinical questions\n"
     "  • legal_qa          — legal / law / case-related questions\n"
     "  • vision_llm        — describing, captioning, or answering open-ended "
@@ -41,14 +40,19 @@ _SYSTEM_PROMPT = (
     "  • object_detection  — detecting, localising, counting, or highlighting "
     "objects in an image\n\n"
     "Rules:\n"
-    "1. When the user mentions 'detect', 'find objects', 'highlight', 'bounding box', "
+    "1. For NEW domain questions (medical, legal, or about an attached image), "
+    "you MUST call the appropriate tool — do not answer from your own knowledge.\n"
+    "2. For FOLLOW-UP questions that refer to a previous answer in the conversation "
+    "(e.g. 'summarize that', 'explain it simpler', 'what does X mean in your last "
+    "answer', 'translate the above'), answer DIRECTLY from the conversation history "
+    "without calling a tool.\n"
+    "3. When the user mentions 'detect', 'find objects', 'highlight', 'bounding box', "
     "or asks 'what objects are in this image', ALWAYS call `object_detection`.\n"
-    "2. When the user explicitly names a tool (e.g. 'use object detect tool'), "
-    "you MUST call that tool.\n"
-    "3. When an image is attached and the question is descriptive (e.g. 'what is this?', "
+    "4. When the user explicitly names a tool, you MUST call that tool.\n"
+    "5. When an image is attached and the question is descriptive (e.g. 'what is this?', "
     "'describe this image'), call `vision_llm`.\n"
-    "4. Never produce a final answer without first calling a tool when an image is attached.\n"
-    "5. For vision tools, do NOT try to include the image data in the arguments — "
+    "6. Never produce a final answer to a NEW domain question without first calling a tool.\n"
+    "7. For vision tools, do NOT include the image data in the arguments — "
     "the system injects it automatically. Just call the tool with the user's query."
 )
 
@@ -56,6 +60,18 @@ _SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # Pydantic schemas
 # ---------------------------------------------------------------------------
+
+
+class ChatTurn(BaseModel):
+    """A single prior turn in the conversation.
+
+    Attributes:
+        role: Either ``"user"`` or ``"assistant"``.
+        content: Plain-text content of that turn.
+    """
+
+    role: str
+    content: str
 
 
 class ChatRequest(BaseModel):
@@ -66,11 +82,19 @@ class ChatRequest(BaseModel):
         image_base64: Optional base64-encoded image (JPEG / PNG / WebP).
         session_id: Optional opaque session identifier for future multi-turn
             memory support.
+        history: Prior conversation turns supplied by the client so the agent
+            can answer follow-up questions. Only text content is sent — images
+            from earlier turns are not replayed.
     """
 
     message: str
     image_base64: Optional[str] = None
     session_id: Optional[str] = None
+    history: list[ChatTurn] = []
+
+
+# Cap on how many prior turns we replay to keep token usage bounded.
+_MAX_HISTORY_TURNS: int = 10
 
 
 class ChatResponse(BaseModel):
@@ -230,9 +254,21 @@ async def chat(request: ChatRequest) -> ChatResponse:
             }
         )
 
+    # Replay prior turns (text-only) so the agent can answer follow-ups.
+    history_messages: list = []
+    for turn in request.history[-_MAX_HISTORY_TURNS:]:
+        text = (turn.content or "").strip()
+        if not text:
+            continue
+        if turn.role == "user":
+            history_messages.append(HumanMessage(content=text))
+        elif turn.role == "assistant":
+            history_messages.append(AIMessage(content=text))
+
     initial_state = {
         "messages": [
             SystemMessage(content=_SYSTEM_PROMPT),
+            *history_messages,
             HumanMessage(content=human_content),
         ],
         "tool_used": "",

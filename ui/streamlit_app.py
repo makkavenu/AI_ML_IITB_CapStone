@@ -66,6 +66,7 @@ def call_chat_api(
     message: str,
     image_base64: Optional[str],
     session_id: str,
+    history: list[dict],
 ) -> dict:
     """POST a chat message to the FastAPI backend.
 
@@ -73,6 +74,8 @@ def call_chat_api(
         message: User's plain-text question.
         image_base64: Optional base64-encoded image data.
         session_id: Opaque session identifier.
+        history: Prior conversation turns as a list of
+            ``{"role": "user"|"assistant", "content": str}`` dicts.
 
     Returns:
         Parsed JSON response dict containing ``response``, ``tool_used``,
@@ -83,12 +86,17 @@ def call_chat_api(
         requests.ConnectionError: When the API is not reachable.
         requests.Timeout: When the request exceeds the timeout.
     """
-    payload: dict = {"message": message, "session_id": session_id}
+    payload: dict = {
+        "message": message,
+        "session_id": session_id,
+        "history": history,
+    }
     if image_base64:
         payload["image_base64"] = image_base64
 
     logger.info(
-        "call_chat_api | session=%s image=%s", session_id, bool(image_base64)
+        "call_chat_api | session=%s image=%s history_turns=%d",
+        session_id, bool(image_base64), len(history),
     )
     response = requests.post(
         CHAT_ENDPOINT,
@@ -173,35 +181,53 @@ def main() -> None:
     for msg in st.session_state.messages:
         _render_message(msg)
 
-    # ---- Image upload ----------------------------------------------------
-    uploaded_file = st.file_uploader(
-        "📎 Attach an image (optional — activates vision / detection tools)",
-        type=["png", "jpg", "jpeg", "webp"],
-        label_visibility="visible",
+    # ---- Chat input with built-in file upload ----------------------------
+    # `accept_file=True` (Streamlit >= 1.43) renders an upload button inside
+    # the chat input bar. The returned object exposes `.text` and `.files`.
+    chat_value = st.chat_input(
+        "Ask anything…  (attach an image to use vision / detection tools)",
+        accept_file=True,
+        file_type=["png", "jpg", "jpeg", "webp"],
     )
-    image_base64: Optional[str] = None
-    if uploaded_file is not None:
-        image_bytes = uploaded_file.read()
-        image_base64 = encode_image(image_bytes)
-        st.image(uploaded_file, caption="Attached image", width=300)
+    if not chat_value:
+        return
 
-    # ---- Chat input ------------------------------------------------------
-    user_input: Optional[str] = st.chat_input("Ask anything…")
-    if not user_input:
+    user_input: str = (chat_value.text or "").strip()
+    uploaded_files = chat_value.files or []
+
+    image_base64: Optional[str] = None
+    image_bytes: Optional[bytes] = None
+    if uploaded_files:
+        # Only use the first attached image per turn.
+        image_bytes = uploaded_files[0].read()
+        image_base64 = encode_image(image_bytes)
+
+    if not user_input and not image_base64:
         return
 
     # Append & render user message immediately
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    _render_message({"role": "user", "content": user_input})
+    user_msg: dict = {"role": "user", "content": user_input or "(image attached)"}
+    st.session_state.messages.append(user_msg)
+    with st.chat_message("user"):
+        st.markdown(user_msg["content"])
+        if image_bytes:
+            st.image(image_bytes, caption="Attached image", width=300)
+
+    # Build prior history (exclude the just-appended user message) — text only.
+    history_payload: list[dict] = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state.messages[:-1]
+    ]
 
     # Call API & stream response
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             try:
                 result = call_chat_api(
-                    user_input,
+                    user_input or "Describe the attached image.",
                     image_base64,
                     st.session_state.session_id,
+                    history_payload,
                 )
                 response_text: str = result.get("response", "No response received.")
                 tool_used: str = result.get("tool_used", "")
