@@ -1,22 +1,23 @@
-"""FastAPI router — /api/chat endpoint.
+"""FastAPI router — /api/chat and /api/chat/stream endpoints.
 
 Flow
 ----
 1. Validate & scan user input with guardrail_scanner.scan_text_content().
-2. Build initial LangGraph state (with optional image).
-3. Invoke the compiled agent graph asynchronously.
+2. Build initial LangGraph state (with optional image + prior history).
+3. Invoke the compiled agent graph (ainvoke for /chat, astream for /chat/stream).
 4. Scan agent output with guardrail_scanner.scan_text_content().
-5. Return ChatResponse.
+5. Return ChatResponse (/chat) or stream Server-Sent Events (/chat/stream).
 """
 
 import base64
 import io
 import json
 import logging
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 from fastapi import APIRouter, HTTPException
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from fastapi.responses import StreamingResponse
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from PIL import Image, ImageDraw
 from pydantic import BaseModel
 
@@ -35,26 +36,62 @@ _SYSTEM_PROMPT = (
     "You are a multi-modal AI assistant with access to four tools:\n"
     "  • medical_qa        — medical / health / clinical questions\n"
     "  • legal_qa          — legal / law / case-related questions\n"
-    "  • vision_llm        — describing, captioning, or answering open-ended "
-    "questions about an image\n"
+    "  • vision_llm        — describing or extracting text from an image\n"
     "  • object_detection  — detecting, localising, counting, or highlighting "
     "objects in an image\n\n"
     "Rules:\n"
     "1. For NEW domain questions (medical, legal, or about an attached image), "
     "you MUST call the appropriate tool — do not answer from your own knowledge.\n"
-    "2. For FOLLOW-UP questions that refer to a previous answer in the conversation "
-    "(e.g. 'summarize that', 'explain it simpler', 'what does X mean in your last "
-    "answer', 'translate the above'), answer DIRECTLY from the conversation history "
-    "without calling a tool.\n"
-    "3. When the user mentions 'detect', 'find objects', 'highlight', 'bounding box', "
-    "or asks 'what objects are in this image', ALWAYS call `object_detection`.\n"
+    "2. For FOLLOW-UP questions that refer to a previous answer in the "
+    "conversation (e.g. 'summarize that', 'explain it simpler', 'translate the "
+    "above'), answer DIRECTLY from the conversation history without calling a tool.\n"
+    "3. When the user mentions 'detect', 'find objects', 'highlight', "
+    "'bounding box', or 'what objects are in this image', ALWAYS call "
+    "`object_detection`.\n"
     "4. When the user explicitly names a tool, you MUST call that tool.\n"
-    "5. When an image is attached and the question is descriptive (e.g. 'what is this?', "
-    "'describe this image'), call `vision_llm`.\n"
-    "6. Never produce a final answer to a NEW domain question without first calling a tool.\n"
-    "7. For vision tools, do NOT include the image data in the arguments — "
-    "the system injects it automatically. Just call the tool with the user's query."
+    "5. CHAIN TOOLS when needed. Examples:\n"
+    "   • If an image contains a LEGAL question or legal document and the user "
+    "asks a legal question about it: FIRST call `vision_llm` to extract the "
+    "text / question from the image, THEN call `legal_qa` with that extracted "
+    "text as the query.\n"
+    "   • If an image contains a MEDICAL question or report and the user asks "
+    "a medical question about it: FIRST call `vision_llm` to extract the text, "
+    "THEN call `medical_qa` with that extracted text as the query.\n"
+    "   • Do NOT rely on your own multi-modal capabilities to read text from "
+    "images — always use `vision_llm` for that.\n"
+    "6. When the image question is purely descriptive ('what is this?', "
+    "'describe this image'), call `vision_llm` alone — no chaining needed.\n"
+    "7. After tools return results, decide if another tool call is needed. "
+    "If you have enough information, produce the final answer for the user.\n"
+    "8. For vision tools, do NOT include image data in the arguments — "
+    "the system injects it automatically. Just call the tool with the query.\n"
+    "9. You may call up to 4 tools per request."
 )
+
+
+# Friendly descriptions used for the live routing commentary in the UI.
+_TOOL_FRIENDLY_NAME: dict[str, str] = {
+    "medical_qa": "the **medical Q&A** tool (MedGemma)",
+    "legal_qa": "the **legal Q&A** tool (Pinecone RAG + Qwen)",
+    "vision_llm": "the **vision** tool (Qwen3-VL)",
+    "object_detection": "the **object detection** tool (YOLOv8)",
+}
+
+
+def _routing_message(tool_name: str) -> str:
+    """Build a user-facing one-liner describing the tool the agent just chose.
+
+    Args:
+        tool_name: The tool name emitted by the orchestrator.
+
+    Returns:
+        A short markdown string suitable for rendering above the spinner.
+    """
+    friendly = _TOOL_FRIENDLY_NAME.get(tool_name, f"`{tool_name}`")
+    return (
+        f"I've routed your question to {friendly}. "
+        "Please hold on while I retrieve the answer…"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -102,15 +139,17 @@ class ChatResponse(BaseModel):
 
     Attributes:
         response: The agent's final textual answer.
-        tool_used: Name of the tool invoked by the agent (empty if none).
+        tool_used: Name of the last tool invoked by the agent (empty if none).
+        tools_chain: Ordered list of every tool invoked for this request.
         guardrail_flagged: True when the output was blocked by guardrails.
         annotated_image_base64: Base64-encoded JPEG of the original image with
-            bounding boxes drawn on it. Only populated when ``tool_used`` is
-            ``object_detection`` and detection results are available.
+            bounding boxes drawn on it. Only populated when ``object_detection``
+            was invoked and detection results are available.
     """
 
     response: str
     tool_used: str
+    tools_chain: list[str] = []
     guardrail_flagged: bool
     annotated_image_base64: Optional[str] = None
 
@@ -201,6 +240,84 @@ def _draw_detections(image_b64: str, tool_output_raw: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_input_guardrail(message: str) -> None:
+    """Run input guardrails; raise HTTPException on failure or block.
+
+    Args:
+        message: Raw user input.
+
+    Raises:
+        HTTPException 400 when blocked, 500 when scanner crashes.
+    """
+    try:
+        scan = scan_text_content(message)
+    except Exception:
+        logger.exception("Input guardrail scan raised an unexpected exception")
+        raise HTTPException(status_code=500, detail="Guardrail scan error on input.")
+    if scan.flagged:
+        logger.warning("Input blocked | category=%s reason=%s", scan.category, scan.reason)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Input blocked by safety guardrails: {scan.reason}",
+        )
+
+
+def _build_initial_state(request: ChatRequest) -> dict:
+    """Construct the LangGraph initial state from a chat request.
+
+    Args:
+        request: Parsed ChatRequest body.
+
+    Returns:
+        State dict matching ``AgentState`` shape.
+    """
+    human_content: list = [{"type": "text", "text": request.message}]
+    if request.image_base64:
+        human_content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{request.image_base64}",
+                    "detail": "auto",
+                },
+            }
+        )
+
+    history_messages: list = []
+    for turn in request.history[-_MAX_HISTORY_TURNS:]:
+        text = (turn.content or "").strip()
+        if not text:
+            continue
+        if turn.role == "user":
+            history_messages.append(HumanMessage(content=text))
+        elif turn.role == "assistant":
+            history_messages.append(AIMessage(content=text))
+
+    return {
+        "messages": [
+            SystemMessage(content=_SYSTEM_PROMPT),
+            *history_messages,
+            HumanMessage(content=human_content),
+        ],
+        "tool_used": "",
+        "tools_chain": [],
+        "image_base64": request.image_base64 or "",
+        "tool_output": "",
+        "tool_outputs_by_name": {},
+        "iterations": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoint — POST /api/chat  (blocking, single JSON response)
+# ---------------------------------------------------------------------------
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """Process a user message through the multi-modal AI agent.
@@ -222,72 +339,15 @@ async def chat(request: ChatRequest) -> ChatResponse:
         bool(request.image_base64),
     )
 
-    # ------------------------------------------------------------------
-    # 1. Input guardrail scan
-    # ------------------------------------------------------------------
-    try:
-        input_scan = scan_text_content(request.message)
-    except Exception:
-        logger.exception("Input guardrail scan raised an unexpected exception")
-        raise HTTPException(status_code=500, detail="Guardrail scan error on input.")
+    _check_input_guardrail(request.message)
+    initial_state = _build_initial_state(request)
 
-    if input_scan.flagged:
-        logger.warning("Input blocked | category=%s reason=%s", input_scan.category, input_scan.reason)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Input blocked by safety guardrails: {input_scan.reason}",
-        )
-
-    # ------------------------------------------------------------------
-    # 2. Build initial agent state
-    # ------------------------------------------------------------------
-    # Compose message content — text always; image added when present.
-    human_content: list = [{"type": "text", "text": request.message}]
-    if request.image_base64:
-        human_content.append(
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{request.image_base64}",
-                    "detail": "auto",
-                },
-            }
-        )
-
-    # Replay prior turns (text-only) so the agent can answer follow-ups.
-    history_messages: list = []
-    for turn in request.history[-_MAX_HISTORY_TURNS:]:
-        text = (turn.content or "").strip()
-        if not text:
-            continue
-        if turn.role == "user":
-            history_messages.append(HumanMessage(content=text))
-        elif turn.role == "assistant":
-            history_messages.append(AIMessage(content=text))
-
-    initial_state = {
-        "messages": [
-            SystemMessage(content=_SYSTEM_PROMPT),
-            *history_messages,
-            HumanMessage(content=human_content),
-        ],
-        "tool_used": "",
-        "image_base64": request.image_base64 or "",
-        "tool_output": "",
-    }
-
-    # ------------------------------------------------------------------
-    # 3. Run agent graph
-    # ------------------------------------------------------------------
     try:
         final_state = await agent_graph.ainvoke(initial_state)
     except Exception:
         logger.exception("agent_graph.ainvoke raised an exception")
         raise HTTPException(status_code=500, detail="Agent processing error.")
 
-    # ------------------------------------------------------------------
-    # 4. Extract last response from state
-    # ------------------------------------------------------------------
     try:
         last_message = final_state["messages"][-1]
         response_text: str = (
@@ -296,13 +356,12 @@ async def chat(request: ChatRequest) -> ChatResponse:
             else str(last_message.content)
         )
         tool_used: str = final_state.get("tool_used", "")
+        tools_chain: list[str] = final_state.get("tools_chain", []) or []
+        tool_outputs_by_name: dict = final_state.get("tool_outputs_by_name", {}) or {}
     except Exception:
         logger.exception("Failed to extract response from final agent state")
         raise HTTPException(status_code=500, detail="Response extraction error.")
 
-    # Guard against empty responses (e.g. when GPT-4o silently refuses or
-    # produces no content and no tool call). Give the user a clear message
-    # rather than rendering a blank assistant bubble in the UI.
     if not response_text.strip():
         logger.warning(
             "Empty model response | tool_used=%r image_provided=%s",
@@ -314,19 +373,11 @@ async def chat(request: ChatRequest) -> ChatResponse:
             "'Detect objects in this image' or 'Describe what is in this image'."
         )
 
-    # ------------------------------------------------------------------
-    # 4b. Draw bounding boxes when object_detection was used
-    # ------------------------------------------------------------------
     annotated_image_b64: Optional[str] = None
-    if tool_used == "object_detection" and request.image_base64:
-        annotated_image_b64 = _draw_detections(
-            request.image_base64,
-            final_state.get("tool_output", ""),
-        )
+    od_output = tool_outputs_by_name.get("object_detection", "")
+    if od_output and request.image_base64:
+        annotated_image_b64 = _draw_detections(request.image_base64, od_output)
 
-    # ------------------------------------------------------------------
-    # 5. Output guardrail scan
-    # ------------------------------------------------------------------
     try:
         output_scan = scan_text_content(response_text)
     except Exception:
@@ -335,19 +386,192 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     if output_scan.flagged:
         logger.warning(
-            "Output blocked | category=%s reason=%s", output_scan.category, output_scan.reason
+            "Output blocked | category=%s reason=%s",
+            output_scan.category, output_scan.reason,
         )
         return ChatResponse(
             response="The agent's response was blocked by safety guardrails.",
             tool_used=tool_used,
+            tools_chain=tools_chain,
             guardrail_flagged=True,
             annotated_image_base64=None,
         )
 
-    logger.info("POST /api/chat | success | tool_used=%r", tool_used)
+    logger.info(
+        "POST /api/chat | success | tool_used=%r tools_chain=%s",
+        tool_used, tools_chain,
+    )
     return ChatResponse(
         response=response_text,
         tool_used=tool_used,
+        tools_chain=tools_chain,
         guardrail_flagged=False,
         annotated_image_base64=annotated_image_b64,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Endpoint — POST /api/chat/stream  (Server-Sent Events)
+# ---------------------------------------------------------------------------
+
+
+def _sse(event: dict) -> str:
+    """Format a dict as a single Server-Sent Event payload.
+
+    Args:
+        event: Arbitrary JSON-serialisable dict.
+
+    Returns:
+        SSE-formatted string ending in a blank line.
+    """
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+@router.post("/chat/stream")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    """Stream agent execution as Server-Sent Events.
+
+    Event types yielded to the client:
+
+      * ``routing``     — orchestrator picked a tool; payload includes ``tool``
+                          and ``message`` (user-facing commentary).
+      * ``tool_done``   — tool finished; payload includes ``tool``.
+      * ``final``       — full response ready; payload mirrors ChatResponse.
+      * ``error``       — terminal error before final event.
+
+    Args:
+        request: Parsed ChatRequest body.
+
+    Returns:
+        StreamingResponse with ``text/event-stream`` media type.
+
+    Raises:
+        HTTPException 400: Input blocked by safety guardrails.
+    """
+    logger.info(
+        "POST /api/chat/stream | session_id=%s image_provided=%s",
+        request.session_id,
+        bool(request.image_base64),
+    )
+
+    # Input guardrail runs synchronously before any streaming starts so we can
+    # surface a clean 400 to the client.
+    _check_input_guardrail(request.message)
+    initial_state = _build_initial_state(request)
+
+    async def event_generator() -> AsyncIterator[str]:
+        emitted_call_ids: set[str] = set()
+        emitted_done_for: set[str] = set()
+        final_state: Optional[dict] = None
+
+        try:
+            async for state in agent_graph.astream(
+                initial_state, stream_mode="values"
+            ):
+                final_state = state
+                msgs = state.get("messages", []) or []
+                if not msgs:
+                    continue
+                last = msgs[-1]
+
+                # Orchestrator just emitted one or more tool calls.
+                if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
+                    for tc in last.tool_calls:
+                        tc_id = tc.get("id") or ""
+                        if tc_id and tc_id in emitted_call_ids:
+                            continue
+                        emitted_call_ids.add(tc_id)
+                        yield _sse({
+                            "type": "routing",
+                            "tool": tc["name"],
+                            "message": _routing_message(tc["name"]),
+                        })
+
+                # Tool executor finished — emit a 'tool_done' for whichever
+                # tool ran most recently (matched against tools_chain length).
+                if isinstance(last, ToolMessage):
+                    chain = state.get("tools_chain", []) or []
+                    if chain:
+                        latest_tool = chain[-1]
+                        marker = f"{latest_tool}:{len(chain)}"
+                        if marker not in emitted_done_for:
+                            emitted_done_for.add(marker)
+                            yield _sse({
+                                "type": "tool_done",
+                                "tool": latest_tool,
+                            })
+        except Exception as exc:
+            logger.exception("chat_stream | graph execution failed")
+            yield _sse({"type": "error", "message": f"Agent error: {exc}"})
+            return
+
+        if final_state is None:
+            yield _sse({"type": "error", "message": "Agent produced no state."})
+            return
+
+        # ---- Extract final response from accumulated state ----------------
+        try:
+            last_message = final_state["messages"][-1]
+            response_text: str = (
+                last_message.content
+                if isinstance(last_message.content, str)
+                else str(last_message.content)
+            )
+        except Exception:
+            logger.exception("chat_stream | could not extract final response")
+            yield _sse({"type": "error", "message": "Response extraction error."})
+            return
+
+        tool_used: str = final_state.get("tool_used", "") or ""
+        tools_chain: list[str] = final_state.get("tools_chain", []) or []
+        tool_outputs_by_name: dict = final_state.get("tool_outputs_by_name", {}) or {}
+
+        if not response_text.strip():
+            response_text = (
+                "I couldn't produce a response for that request. "
+                "Please try rephrasing your question."
+            )
+
+        # ---- Output guardrail --------------------------------------------
+        try:
+            output_scan = scan_text_content(response_text)
+        except Exception:
+            logger.exception("chat_stream | output guardrail crashed")
+            yield _sse({"type": "error", "message": "Guardrail scan error on output."})
+            return
+
+        if output_scan.flagged:
+            yield _sse({
+                "type": "final",
+                "response": "The agent's response was blocked by safety guardrails.",
+                "tool_used": tool_used,
+                "tools_chain": tools_chain,
+                "guardrail_flagged": True,
+                "annotated_image_base64": None,
+            })
+            return
+
+        # ---- Annotate detections if object_detection ran ------------------
+        annotated_image_b64: Optional[str] = None
+        od_output = tool_outputs_by_name.get("object_detection", "")
+        if od_output and request.image_base64:
+            annotated_image_b64 = _draw_detections(request.image_base64, od_output)
+
+        yield _sse({
+            "type": "final",
+            "response": response_text,
+            "tool_used": tool_used,
+            "tools_chain": tools_chain,
+            "guardrail_flagged": False,
+            "annotated_image_base64": annotated_image_b64,
+        })
+        logger.info(
+            "POST /api/chat/stream | success | tools_chain=%s",
+            tools_chain,
+        )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

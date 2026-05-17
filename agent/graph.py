@@ -1,17 +1,18 @@
 """LangGraph StateGraph for the multi-modal AI agent.
 
-Graph topology
---------------
-  orchestrator ──(tool_call?)──► tool_executor ──► synthesizer ──► END
+Graph topology (ReAct loop, supports multi-tool chaining)
+---------------------------------------------------------
+  orchestrator ──(tool_call?)──► tool_executor ──► orchestrator (loop)
        │
-       └──(no tool)──► END
+       └──(no tool / max iters)──► END
 
 Nodes
 -----
-- orchestrator : GPT-4o with bound tools decides which tool (if any) to call.
-- tool_executor: Runs the chosen tool and appends a ToolMessage to state.
-- synthesizer  : GPT-4o reads the full conversation (including tool output)
-                 and produces the final user-facing response.
+- orchestrator : GPT-4o with bound tools. Either emits tool call(s) or
+                 produces the final user-facing answer.
+- tool_executor: Runs the chosen tool(s) and appends ToolMessage(s) to state.
+                 Loops back to the orchestrator so it can chain another tool
+                 (e.g. vision_llm → legal_qa) or produce the final response.
 """
 
 import logging
@@ -28,6 +29,11 @@ from agent.tools.tool_definitions import TOOL_MAP, TOOLS
 logger = logging.getLogger(__name__)
 
 
+# Maximum number of tool-executor cycles per request. Prevents accidental
+# infinite loops if the orchestrator keeps requesting tool calls.
+MAX_ITERATIONS: int = 4
+
+
 # ---------------------------------------------------------------------------
 # State schema
 # ---------------------------------------------------------------------------
@@ -38,15 +44,22 @@ class AgentState(TypedDict):
 
     Attributes:
         messages: Full conversation history (managed by LangGraph add_messages).
-        tool_used: Name of the last tool invoked (empty string if none).
+        tool_used: Name of the LAST tool invoked (empty string if none).
+        tools_chain: Ordered list of tool names invoked across the request.
         image_base64: Base64-encoded image supplied by the user (may be empty).
         tool_output: Raw string output from the last tool call.
+        tool_outputs_by_name: Per-tool latest raw output (for downstream
+            consumers such as bounding-box drawing).
+        iterations: Number of tool-executor cycles completed so far.
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
     tool_used: str
+    tools_chain: list[str]
     image_base64: Optional[str]
     tool_output: str
+    tool_outputs_by_name: dict[str, str]
+    iterations: int
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +89,12 @@ def _make_llm(*, bind_tools: bool = False) -> ChatOpenAI:
 
 
 async def orchestrator_node(state: AgentState) -> dict:
-    """GPT-4o orchestrator: inspect the conversation and decide which tool to use.
+    """GPT-4o orchestrator.
+
+    On the first call, decides which tool to invoke (if any).
+    On subsequent calls (after tool results are in the conversation), it
+    decides whether to call another tool or produce the final user-facing
+    answer.
 
     Args:
         state: Current agent state containing the conversation history.
@@ -84,25 +102,26 @@ async def orchestrator_node(state: AgentState) -> dict:
     Returns:
         Partial state update with the orchestrator's AIMessage appended.
     """
-    logger.info("orchestrator_node | message_count=%d", len(state["messages"]))
-    try:
-        llm = _make_llm(bind_tools=True)
-        response: AIMessage = await llm.ainvoke(state["messages"])
-        logger.info(
-            "orchestrator_node | tool_calls=%s",
-            [tc["name"] for tc in (response.tool_calls or [])],
-        )
-        return {"messages": [response], "tool_used": "", "tool_output": ""}
-    except Exception:
-        logger.exception("orchestrator_node raised an exception")
-        raise
+    iters = state.get("iterations", 0)
+    logger.info(
+        "orchestrator_node | iterations=%d message_count=%d",
+        iters, len(state["messages"]),
+    )
+    llm = _make_llm(bind_tools=True)
+    response: AIMessage = await llm.ainvoke(state["messages"])
+    logger.info(
+        "orchestrator_node | tool_calls=%s",
+        [tc["name"] for tc in (response.tool_calls or [])],
+    )
+    return {"messages": [response]}
 
 
 async def tool_executor_node(state: AgentState) -> dict:
     """Run every tool call emitted by the orchestrator.
 
     Injects ``image_base64`` from state into any vision / detection tool that
-    did not already receive it from the LLM.
+    did not already receive it from the LLM. Loops back to the orchestrator
+    when finished so multi-tool chains are supported.
 
     Args:
         state: Current agent state; the last message must be an AIMessage with
@@ -111,17 +130,23 @@ async def tool_executor_node(state: AgentState) -> dict:
     Returns:
         Partial state update with ToolMessages appended and tool metadata set.
     """
-    logger.info("tool_executor_node | executing tool(s)")
     last_message: AIMessage = state["messages"][-1]
+    logger.info(
+        "tool_executor_node | executing %d tool call(s)",
+        len(last_message.tool_calls or []),
+    )
 
     tool_messages: list[ToolMessage] = []
     tool_used: str = ""
     tool_output: str = ""
+    chain_addition: list[str] = []
+    outputs_addition: dict[str, str] = {}
 
     for tool_call in last_message.tool_calls:
         tool_name: str = tool_call["name"]
         tool_args: dict = dict(tool_call["args"])
         tool_used = tool_name
+        chain_addition.append(tool_name)
 
         # GPT-4o cannot pass large binary data in tool call arguments — it either
         # omits image_base64 entirely or substitutes a short placeholder string
@@ -137,7 +162,10 @@ async def tool_executor_node(state: AgentState) -> dict:
                     len(real_image),
                 )
 
-        logger.info("tool_executor_node | tool=%s args_keys=%s", tool_name, list(tool_args.keys()))
+        logger.info(
+            "tool_executor_node | tool=%s args_keys=%s",
+            tool_name, list(tool_args.keys()),
+        )
 
         selected_tool = TOOL_MAP.get(tool_name)
         if selected_tool is None:
@@ -151,34 +179,22 @@ async def tool_executor_node(state: AgentState) -> dict:
                 result = f"Tool '{tool_name}' encountered an internal error."
 
         tool_output = str(result)
+        outputs_addition[tool_name] = tool_output
         tool_messages.append(
             ToolMessage(content=tool_output, tool_call_id=tool_call["id"])
         )
 
+    merged_outputs = {**state.get("tool_outputs_by_name", {}), **outputs_addition}
+    new_chain = list(state.get("tools_chain", [])) + chain_addition
+
     return {
         "messages": tool_messages,
         "tool_used": tool_used,
+        "tools_chain": new_chain,
         "tool_output": tool_output,
+        "tool_outputs_by_name": merged_outputs,
+        "iterations": state.get("iterations", 0) + 1,
     }
-
-
-async def synthesizer_node(state: AgentState) -> dict:
-    """GPT-4o synthesizer: craft the final user-facing response from tool output.
-
-    Args:
-        state: Current agent state with the full conversation including tool output.
-
-    Returns:
-        Partial state update with the synthesizer's AIMessage appended.
-    """
-    logger.info("synthesizer_node | composing final response")
-    try:
-        llm = _make_llm(bind_tools=False)
-        response: AIMessage = await llm.ainvoke(state["messages"])
-        return {"messages": [response]}
-    except Exception:
-        logger.exception("synthesizer_node raised an exception")
-        raise
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +206,7 @@ def _route_after_orchestrator(
     state: AgentState,
 ) -> Literal["tool_executor", "__end__"]:
     """Conditional edge: branch to tool_executor when the orchestrator emitted
-    tool calls, otherwise end the graph.
+    tool calls AND we haven't exhausted the iteration budget; otherwise end.
 
     Args:
         state: Current agent state.
@@ -199,13 +215,18 @@ def _route_after_orchestrator(
         ``'tool_executor'`` or ``END`` (``'__end__'``).
     """
     last_message: AIMessage = state["messages"][-1]
-    if getattr(last_message, "tool_calls", None):
+    iters = state.get("iterations", 0)
+    if getattr(last_message, "tool_calls", None) and iters < MAX_ITERATIONS:
         logger.info(
-            "_route_after_orchestrator | routing to tool_executor (%d call(s))",
-            len(last_message.tool_calls),
+            "_route_after_orchestrator | routing to tool_executor "
+            "(%d call(s), iter=%d/%d)",
+            len(last_message.tool_calls), iters, MAX_ITERATIONS,
         )
         return "tool_executor"
-    logger.info("_route_after_orchestrator | no tool calls — ending graph")
+    if iters >= MAX_ITERATIONS:
+        logger.warning("_route_after_orchestrator | iteration cap reached — ending")
+    else:
+        logger.info("_route_after_orchestrator | no tool calls — ending graph")
     return END
 
 
@@ -224,7 +245,6 @@ def build_graph():
 
     graph.add_node("orchestrator", orchestrator_node)
     graph.add_node("tool_executor", tool_executor_node)
-    graph.add_node("synthesizer", synthesizer_node)
 
     graph.set_entry_point("orchestrator")
 
@@ -233,10 +253,11 @@ def build_graph():
         _route_after_orchestrator,
         {"tool_executor": "tool_executor", END: END},
     )
-    graph.add_edge("tool_executor", "synthesizer")
-    graph.add_edge("synthesizer", END)
+    # Loop back so the orchestrator can chain another tool or synthesise the
+    # final answer once it has tool results.
+    graph.add_edge("tool_executor", "orchestrator")
 
-    logger.info("build_graph | graph compiled successfully")
+    logger.info("build_graph | graph compiled successfully (ReAct loop)")
     return graph.compile()
 
 
