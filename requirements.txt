@@ -6,6 +6,7 @@ pydantic>=2.7.0
 # LangChain / LangGraph
 langchain-core>=0.2.0
 langchain-openai>=0.1.8
+langchain-aws>=0.2.0
 langgraph>=0.1.0
 
 # HTTP client (used in real endpoint stubs)

@@ -21,7 +21,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from PIL import Image, ImageDraw
 from pydantic import BaseModel
 
-from agent.graph import agent_graph
+from agent.graph import (
+    DEFAULT_ORCHESTRATOR_MODEL,
+    ORCHESTRATOR_MODELS,
+    agent_graph,
+)
 from app.guardrails.guardrail_scanner import scan_text_content
 
 logger = logging.getLogger(__name__)
@@ -39,33 +43,50 @@ _SYSTEM_PROMPT = (
     "  • vision_llm        — describing or extracting text from an image\n"
     "  • object_detection  — detecting, localising, counting, or highlighting "
     "objects in an image\n\n"
+    "IMPORTANT CONTEXT:\n"
+    "• You CANNOT see images directly. Image bytes are NEVER given to you.\n"
+    "• Whenever the user has attached an image, the user message will contain "
+    "the marker `[IMAGE_ATTACHED]`. In that case you MUST call `vision_llm` "
+    "(or `object_detection` when the question is about detecting/highlighting "
+    "objects) to inspect the image. Do not attempt to describe or read the "
+    "image yourself.\n\n"
     "Rules:\n"
-    "1. For NEW domain questions (medical, legal, or about an attached image), "
-    "you MUST call the appropriate tool — do not answer from your own knowledge.\n"
-    "2. For FOLLOW-UP questions that refer to a previous answer in the "
-    "conversation (e.g. 'summarize that', 'explain it simpler', 'translate the "
-    "above'), answer DIRECTLY from the conversation history without calling a tool.\n"
+    "1. STRONGLY PREFER calling a tool. Your tools cover a very broad scope:\n"
+    "   • `medical_qa`  → ANY health, medical, clinical, anatomy, disease, "
+    "symptom, drug, treatment, hospital, doctor, or wellness question.\n"
+    "   • `legal_qa`    → ANY law, legal, statute, act, section, court, case, "
+    "rights, contract, police, FIR, IPC, CrPC, constitution, or regulation "
+    "question — including basic definitions like 'what is FIR?', "
+    "'what is bail?', 'what is section 302?'.\n"
+    "   • `vision_llm` / `object_detection` → ANY question involving an "
+    "attached image.\n"
+    "   If the question is even loosely related to one of these domains, "
+    "you MUST call the matching tool. Do NOT answer from your own knowledge.\n"
+    "2. Only answer DIRECTLY (without a tool) when EITHER:\n"
+    "   (a) the question is a FOLLOW-UP that refers to the previous answer in "
+    "the conversation (e.g. 'summarize that', 'explain it simpler', "
+    "'translate the above'), OR\n"
+    "   (b) the question is COMPLETELY UNRELATED to medical, legal, or image "
+    "topics (e.g. small talk, greetings, math, general trivia, coding). "
+    "In this case answer briefly from your own knowledge.\n"
     "3. When the user mentions 'detect', 'find objects', 'highlight', "
     "'bounding box', or 'what objects are in this image', ALWAYS call "
     "`object_detection`.\n"
     "4. When the user explicitly names a tool, you MUST call that tool.\n"
-    "5. CHAIN TOOLS when needed. Examples:\n"
-    "   • If an image contains a LEGAL question or legal document and the user "
-    "asks a legal question about it: FIRST call `vision_llm` to extract the "
-    "text / question from the image, THEN call `legal_qa` with that extracted "
-    "text as the query.\n"
-    "   • If an image contains a MEDICAL question or report and the user asks "
-    "a medical question about it: FIRST call `vision_llm` to extract the text, "
-    "THEN call `medical_qa` with that extracted text as the query.\n"
-    "   • Do NOT rely on your own multi-modal capabilities to read text from "
-    "images — always use `vision_llm` for that.\n"
-    "6. When the image question is purely descriptive ('what is this?', "
-    "'describe this image'), call `vision_llm` alone — no chaining needed.\n"
-    "7. After tools return results, decide if another tool call is needed. "
+    "5. CHAIN TOOLS when needed. Examples (with `[IMAGE_ATTACHED]`):\n"
+    "   • Legal question shown in / about an image → FIRST call `vision_llm` "
+    "to extract the question / document text, THEN call `legal_qa` with the "
+    "extracted text as the `query` argument.\n"
+    "   • Medical question shown in / about an image → FIRST call `vision_llm` "
+    "to extract the text, THEN call `medical_qa` with the extracted text.\n"
+    "   • Pure descriptive question about the image ('what is this?', "
+    "'describe this image') → call `vision_llm` alone.\n"
+    "6. After tools return results, decide if another tool call is needed. "
     "If you have enough information, produce the final answer for the user.\n"
-    "8. For vision tools, do NOT include image data in the arguments — "
-    "the system injects it automatically. Just call the tool with the query.\n"
-    "9. You may call up to 4 tools per request."
+    "7. For vision tools, do NOT include image data in the arguments — "
+    "the system injects it automatically. Just call the tool with the user's "
+    "query text.\n"
+    "8. You may call up to 4 tools per request."
 )
 
 
@@ -128,6 +149,7 @@ class ChatRequest(BaseModel):
     image_base64: Optional[str] = None
     session_id: Optional[str] = None
     history: list[ChatTurn] = []
+    orchestrator_model: Optional[str] = None
 
 
 # Cap on how many prior turns we replay to keep token usage bounded.
@@ -276,17 +298,23 @@ def _build_initial_state(request: ChatRequest) -> dict:
     Returns:
         State dict matching ``AgentState`` shape.
     """
-    human_content: list = [{"type": "text", "text": request.message}]
+    # The orchestrator NEVER receives image bytes directly. We only signal
+    # that an image is present via a text marker. The actual base64 image is
+    # carried in agent state and injected into vision_llm / object_detection
+    # tool calls at execution time. This works for both multi-modal (GPT-4o)
+    # and text-only (Qwen on Bedrock) orchestrators uniformly, and forces the
+    # orchestrator to route through `vision_llm` to "see" the image.
+    user_text = request.message or ""
     if request.image_base64:
-        human_content.append(
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{request.image_base64}",
-                    "detail": "auto",
-                },
-            }
+        marker = (
+            "\n\n[IMAGE_ATTACHED] An image has been attached. You cannot see "
+            "it directly — use the `vision_llm` tool (or `object_detection` "
+            "for detection requests) to inspect it. For domain questions about "
+            "the image, chain `vision_llm` first, then the domain tool."
         )
+        user_text = (user_text + marker).strip()
+
+    human_content: str = user_text
 
     history_messages: list = []
     for turn in request.history[-_MAX_HISTORY_TURNS:]:
@@ -309,6 +337,11 @@ def _build_initial_state(request: ChatRequest) -> dict:
         "image_base64": request.image_base64 or "",
         "tool_output": "",
         "tool_outputs_by_name": {},
+        "orchestrator_model": (
+            request.orchestrator_model
+            if request.orchestrator_model in ORCHESTRATOR_MODELS
+            else DEFAULT_ORCHESTRATOR_MODEL
+        ),
         "iterations": 0,
     }
 

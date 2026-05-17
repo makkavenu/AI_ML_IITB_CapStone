@@ -46,6 +46,14 @@ _TOOL_ICONS: dict[str, str] = {
     "object_detection": "🔍",
 }
 
+# Orchestrator model options shown in the sidebar.
+# The first entry is the default selection.
+_ORCHESTRATOR_MODEL_OPTIONS: list[dict[str, str]] = [
+    {"key": "qwen3-32b", "label": "Qwen3-32B (AWS Bedrock)"},
+    {"key": "gpt-4o",    "label": "GPT-4o (OpenAI)"},
+]
+_DEFAULT_ORCHESTRATOR_MODEL_KEY: str = _ORCHESTRATOR_MODEL_OPTIONS[0]["key"]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,6 +77,7 @@ def call_chat_api(
     image_base64: Optional[str],
     session_id: str,
     history: list[dict],
+    orchestrator_model: Optional[str] = None,
 ) -> dict:
     """POST a chat message to the FastAPI backend (non-streaming).
 
@@ -81,6 +90,8 @@ def call_chat_api(
     }
     if image_base64:
         payload["image_base64"] = image_base64
+    if orchestrator_model:
+        payload["orchestrator_model"] = orchestrator_model
 
     logger.info(
         "call_chat_api | session=%s image=%s history_turns=%d",
@@ -100,6 +111,7 @@ def stream_chat_api(
     image_base64: Optional[str],
     session_id: str,
     history: list[dict],
+    orchestrator_model: Optional[str] = None,
 ) -> Iterator[dict]:
     """POST to /api/chat/stream and yield parsed Server-Sent Event payloads.
 
@@ -108,6 +120,8 @@ def stream_chat_api(
         image_base64: Optional base64-encoded image data.
         session_id: Opaque session identifier.
         history: Prior conversation turns.
+        orchestrator_model: Optional model key (e.g. ``"qwen3-32b"`` or
+            ``"gpt-4o"``) selecting which LLM orchestrates the agent.
 
     Yields:
         Parsed JSON dicts. Each has a ``type`` field:
@@ -123,6 +137,8 @@ def stream_chat_api(
     }
     if image_base64:
         payload["image_base64"] = image_base64
+    if orchestrator_model:
+        payload["orchestrator_model"] = orchestrator_model
 
     logger.info(
         "stream_chat_api | session=%s image=%s history_turns=%d",
@@ -205,6 +221,8 @@ def main() -> None:
         layout="wide",
     )
 
+    if "orchestrator_model" not in st.session_state:
+        st.session_state.orchestrator_model = _DEFAULT_ORCHESTRATOR_MODEL_KEY
     # ---- Session state initialisation ------------------------------------
     if "messages" not in st.session_state:
         st.session_state.messages: list[dict] = []
@@ -220,7 +238,29 @@ def main() -> None:
 
     # ---- Sidebar ---------------------------------------------------------
     with st.sidebar:
-        st.header("⚙️ Session")
+        st.header("⚙️ S🧠 Orchestrator model**")
+        model_labels = [opt["label"] for opt in _ORCHESTRATOR_MODEL_OPTIONS]
+        model_keys = [opt["key"] for opt in _ORCHESTRATOR_MODEL_OPTIONS]
+        try:
+            default_idx = model_keys.index(st.session_state.orchestrator_model)
+        except ValueError:
+            default_idx = 0
+        selected_label = st.radio(
+            "Choose which LLM routes & answers",
+            options=model_labels,
+            index=default_idx,
+            label_visibility="collapsed",
+            key="orchestrator_model_radio",
+        )
+        st.session_state.orchestrator_model = model_keys[
+            model_labels.index(selected_label)
+        ]
+        st.caption(
+            f"Active: `{st.session_state.orchestrator_model}`"
+        )
+
+        st.markdown("---")
+        st.markdown("**ession")
         st.write(f"**ID:** `{st.session_state.session_id[:8]}…`")
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.messages = []
@@ -288,6 +328,7 @@ def main() -> None:
                 image_base64,
                 st.session_state.session_id,
                 history_payload,
+                orchestrator_model=st.session_state.orchestrator_model,
             ):
                 etype = event.get("type")
                 if etype == "routing":
