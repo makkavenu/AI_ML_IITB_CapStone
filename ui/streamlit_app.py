@@ -5,10 +5,11 @@ Run locally (outside Docker):
 """
 
 import base64
+import json
 import logging
 import sys
 import uuid
-from typing import Optional
+from typing import Iterator, Optional
 
 import requests
 import streamlit as st
@@ -35,7 +36,8 @@ import os
 
 API_BASE_URL: str = os.getenv("API_URL", "http://api:8000")
 CHAT_ENDPOINT: str = f"{API_BASE_URL}/api/chat"
-REQUEST_TIMEOUT_SECONDS: int = 120
+CHAT_STREAM_ENDPOINT: str = f"{API_BASE_URL}/api/chat/stream"
+REQUEST_TIMEOUT_SECONDS: int = 300
 
 _TOOL_ICONS: dict[str, str] = {
     "medical_qa": "🏥",
@@ -68,23 +70,9 @@ def call_chat_api(
     session_id: str,
     history: list[dict],
 ) -> dict:
-    """POST a chat message to the FastAPI backend.
+    """POST a chat message to the FastAPI backend (non-streaming).
 
-    Args:
-        message: User's plain-text question.
-        image_base64: Optional base64-encoded image data.
-        session_id: Opaque session identifier.
-        history: Prior conversation turns as a list of
-            ``{"role": "user"|"assistant", "content": str}`` dicts.
-
-    Returns:
-        Parsed JSON response dict containing ``response``, ``tool_used``,
-        and ``guardrail_flagged``.
-
-    Raises:
-        requests.HTTPError: On 4xx / 5xx responses.
-        requests.ConnectionError: When the API is not reachable.
-        requests.Timeout: When the request exceeds the timeout.
+    Kept for completeness; the UI primarily uses ``stream_chat_api``.
     """
     payload: dict = {
         "message": message,
@@ -107,6 +95,69 @@ def call_chat_api(
     return response.json()
 
 
+def stream_chat_api(
+    message: str,
+    image_base64: Optional[str],
+    session_id: str,
+    history: list[dict],
+) -> Iterator[dict]:
+    """POST to /api/chat/stream and yield parsed Server-Sent Event payloads.
+
+    Args:
+        message: User question.
+        image_base64: Optional base64-encoded image data.
+        session_id: Opaque session identifier.
+        history: Prior conversation turns.
+
+    Yields:
+        Parsed JSON dicts. Each has a ``type`` field:
+        ``routing``, ``tool_done``, ``final`` or ``error``.
+
+    Raises:
+        requests.HTTPError / ConnectionError / Timeout on transport issues.
+    """
+    payload: dict = {
+        "message": message,
+        "session_id": session_id,
+        "history": history,
+    }
+    if image_base64:
+        payload["image_base64"] = image_base64
+
+    logger.info(
+        "stream_chat_api | session=%s image=%s history_turns=%d",
+        session_id, bool(image_base64), len(history),
+    )
+    # NOTE: do NOT use `with requests.post(...) as response:` here. When the
+    # caller stops iterating (e.g. breaks after the `final` event) the context
+    # manager closes the response which, combined with `iter_lines`, can raise
+    # "The content for this response was already consumed" on next access.
+    # Manage the lifecycle explicitly via try/finally instead.
+    response = requests.post(
+        CHAT_STREAM_ENDPOINT,
+        json=payload,
+        stream=True,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        headers={"Accept": "text/event-stream"},
+    )
+    try:
+        response.raise_for_status()
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            if raw_line.startswith("data: "):
+                data = raw_line[len("data: "):]
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "stream_chat_api | bad SSE payload: %r", data[:120]
+                    )
+                    continue
+    finally:
+        response.close()
+
+
 # ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
@@ -117,15 +168,22 @@ def _render_message(msg: dict) -> None:
 
     Args:
         msg: Dict with keys ``role``, ``content``, and optionally
-            ``tool_used``, ``guardrail_flagged``, and
+            ``tool_used``, ``tools_chain``, ``guardrail_flagged``, and
             ``annotated_image_base64``.
     """
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        tool = msg.get("tool_used", "")
-        if tool:
-            icon = _TOOL_ICONS.get(tool, "🔧")
-            st.caption(f"{icon} Tool used: `{tool}`")
+        tools_chain: list[str] = msg.get("tools_chain") or []
+        if tools_chain:
+            chain_str = " → ".join(
+                f"{_TOOL_ICONS.get(t, '🔧')} `{t}`" for t in tools_chain
+            )
+            st.caption(f"🛠️ Tool chain: {chain_str}")
+        else:
+            tool = msg.get("tool_used", "")
+            if tool:
+                icon = _TOOL_ICONS.get(tool, "🔧")
+                st.caption(f"{icon} Tool used: `{tool}`")
         if msg.get("guardrail_flagged"):
             st.warning("⚠️ Guardrail flagged this response.")
         annotated = msg.get("annotated_image_base64")
@@ -221,64 +279,102 @@ def main() -> None:
 
     # Call API & stream response
     with st.chat_message("assistant"):
-        with st.spinner("Thinking…"):
+        status = st.status("🤔 Analyzing your question…", expanded=True)
+        final_event: Optional[dict] = None
+        stream_error: Optional[str] = None
+        try:
+            for event in stream_chat_api(
+                user_input or "Describe the attached image.",
+                image_base64,
+                st.session_state.session_id,
+                history_payload,
+            ):
+                etype = event.get("type")
+                if etype == "routing":
+                    status.markdown(event.get("message", ""))
+                elif etype == "tool_done":
+                    tool = event.get("tool", "")
+                    icon = _TOOL_ICONS.get(tool, "🔧")
+                    status.markdown(
+                        f"{icon} Results received from `{tool}`. Processing…"
+                    )
+                elif etype == "final":
+                    final_event = event
+                    status.update(
+                        label="✅ Done", state="complete", expanded=False
+                    )
+                    # Stop iterating — the server has sent the last event and
+                    # closed the stream. Continuing the loop would attempt to
+                    # read from an already-consumed response and raise
+                    # "The content for this response was already consumed".
+                    break
+                elif etype == "error":
+                    stream_error = event.get("message", "Unknown agent error.")
+                    status.update(
+                        label="❌ Agent error", state="error", expanded=True
+                    )
+                    status.markdown(f"**Error:** {stream_error}")
+                    break
+        except requests.HTTPError as exc:
+            status.update(label="❌ HTTP error", state="error")
             try:
-                result = call_chat_api(
-                    user_input or "Describe the attached image.",
-                    image_base64,
-                    st.session_state.session_id,
-                    history_payload,
+                detail = exc.response.json().get("detail", exc.response.text)
+            except Exception:
+                detail = exc.response.text
+            stream_error = f"API error {exc.response.status_code}: {detail}"
+            st.error(stream_error)
+        except requests.ConnectionError:
+            status.update(label="❌ Connection error", state="error")
+            stream_error = "Cannot reach the API. Is the backend running?"
+            st.error(stream_error)
+        except requests.Timeout:
+            status.update(label="❌ Timeout", state="error")
+            stream_error = "Request timed out. The agent may still be processing."
+            st.error(stream_error)
+        except Exception as exc:
+            status.update(label="❌ Unexpected error", state="error")
+            logger.exception("Unexpected error in Streamlit streaming UI")
+            stream_error = f"Unexpected error: {exc}"
+            st.error(stream_error)
+
+        if final_event is not None:
+            response_text: str = final_event.get(
+                "response", "No response received."
+            )
+            tool_used: str = final_event.get("tool_used", "")
+            tools_chain: list[str] = final_event.get("tools_chain", []) or []
+            guardrail_flagged: bool = final_event.get("guardrail_flagged", False)
+            annotated_b64: Optional[str] = final_event.get("annotated_image_base64")
+
+            st.markdown(response_text)
+            if tools_chain:
+                chain_str = " → ".join(
+                    f"{_TOOL_ICONS.get(t, '🔧')} `{t}`" for t in tools_chain
                 )
-                response_text: str = result.get("response", "No response received.")
-                tool_used: str = result.get("tool_used", "")
-                guardrail_flagged: bool = result.get("guardrail_flagged", False)
-
-                annotated_b64: Optional[str] = result.get("annotated_image_base64")
-
-                st.markdown(response_text)
-                if tool_used:
-                    icon = _TOOL_ICONS.get(tool_used, "🔧")
-                    st.caption(f"{icon} Tool used: `{tool_used}`")
-                if guardrail_flagged:
-                    st.warning("⚠️ Guardrail flagged this response.")
-                if annotated_b64:
-                    ann_bytes = base64.b64decode(annotated_b64)
-                    st.image(ann_bytes, caption="Detected Objects", use_container_width=True)
-
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": response_text,
-                        "tool_used": tool_used,
-                        "guardrail_flagged": guardrail_flagged,
-                        "annotated_image_base64": annotated_b64,
-                    }
+                st.caption(f"🛠️ Tool chain: {chain_str}")
+            elif tool_used:
+                icon = _TOOL_ICONS.get(tool_used, "🔧")
+                st.caption(f"{icon} Tool used: `{tool_used}`")
+            if guardrail_flagged:
+                st.warning("⚠️ Guardrail flagged this response.")
+            if annotated_b64:
+                ann_bytes = base64.b64decode(annotated_b64)
+                st.image(
+                    ann_bytes,
+                    caption="Detected Objects",
+                    use_container_width=True,
                 )
 
-            except requests.HTTPError as exc:
-                status = exc.response.status_code
-                try:
-                    detail = exc.response.json().get("detail", exc.response.text)
-                except Exception:
-                    detail = exc.response.text
-                err_msg = f"API error {status}: {detail}"
-                logger.error("call_chat_api HTTP error | %s", err_msg)
-                st.error(err_msg)
-
-            except requests.ConnectionError:
-                err_msg = "Cannot reach the API. Is the backend running?"
-                logger.error(err_msg)
-                st.error(err_msg)
-
-            except requests.Timeout:
-                err_msg = "Request timed out. The agent may still be processing."
-                logger.error(err_msg)
-                st.error(err_msg)
-
-            except Exception as exc:
-                err_msg = f"Unexpected error: {exc}"
-                logger.exception("Unexpected error in Streamlit UI")
-                st.error(err_msg)
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": response_text,
+                    "tool_used": tool_used,
+                    "tools_chain": tools_chain,
+                    "guardrail_flagged": guardrail_flagged,
+                    "annotated_image_base64": annotated_b64,
+                }
+            )
 
 
 if __name__ == "__main__":
