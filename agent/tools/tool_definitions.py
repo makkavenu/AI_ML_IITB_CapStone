@@ -109,24 +109,35 @@ async def legal_qa(query: str) -> str:
     """Answer legal questions by retrieving relevant documents from Pinecone and
     synthesising an answer with Qwen via AWS Bedrock.
 
+    The blocking RAG pipeline (OpenAI embed → Pinecone query → Bedrock
+    invoke_model) is delegated to a worker thread via ``asyncio.to_thread``
+    so the FastAPI event loop remains responsive.
+
     Args:
         query: The legal question or case description to research.
 
     Returns:
-        A RAG-augmented legal response string.
+        A RAG-augmented legal response string sourced from Indian law
+        (IPC / CrPC / Constitution).
     """
+    import asyncio
+    from agent.tools.query_legal_rag import run_legal_rag
+
     logger.info("legal_qa called | query[:120]=%r", query[:120])
-    # TODO: Wire up Pinecone vector search + AWS Bedrock Qwen invocation.
-    # Steps:
-    #   1. Embed the query: vector = embed_fn(query)
-    #   2. Query Pinecone: docs = index.query(vector=vector, top_k=5)
-    #   3. Build context: context = "\n".join([d.metadata["text"] for d in docs.matches])
-    #   4. Call Bedrock Qwen with context + query
-    return (
-        f"[STUB — Legal RAG + Qwen/Bedrock] Legal answer for: '{query}'. "
-        "Endpoint not yet configured. Set PINECONE_API_KEY, PINECONE_INDEX, "
-        "and AWS credentials, then replace this stub with the real calls."
-    )
+    try:
+        answer: str = await asyncio.to_thread(run_legal_rag, query)
+        logger.info("legal_qa | response_chars=%d", len(answer or ""))
+        return answer or "The legal RAG pipeline returned an empty response."
+    except ValueError as exc:
+        # Missing env vars — surface clearly without leaking internals.
+        logger.error("legal_qa | configuration error: %s", exc)
+        return f"Legal RAG is not configured: {exc}"
+    except Exception:
+        logger.exception("legal_qa | RAG pipeline failed")
+        return (
+            "The legal RAG pipeline encountered an error while processing "
+            "this question. Please try again or rephrase the query."
+        )
 
 
 # ---------------------------------------------------------------------------
