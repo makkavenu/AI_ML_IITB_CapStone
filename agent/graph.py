@@ -16,8 +16,10 @@ Nodes
 """
 
 import logging
-from typing import Annotated, Literal, Optional
+import os
+from typing import Annotated, Any, Literal, Optional
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
@@ -32,6 +34,27 @@ logger = logging.getLogger(__name__)
 # Maximum number of tool-executor cycles per request. Prevents accidental
 # infinite loops if the orchestrator keeps requesting tool calls.
 MAX_ITERATIONS: int = 4
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator model registry
+# ---------------------------------------------------------------------------
+
+# Logical names exposed to the UI → concrete provider + id.
+# Keeping this central makes it trivial to add more options later.
+ORCHESTRATOR_MODELS: dict[str, dict[str, str]] = {
+    "gpt-4o": {
+        "provider": "openai",
+        "model_id": "gpt-4o",
+        "label": "GPT-4o (OpenAI)",
+    },
+    "qwen3-32b": {
+        "provider": "bedrock",
+        "model_id": "qwen.qwen3-32b-v1:0",
+        "label": "Qwen3-32B (AWS Bedrock)",
+    },
+}
+DEFAULT_ORCHESTRATOR_MODEL: str = "qwen3-32b"
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +83,7 @@ class AgentState(TypedDict):
     tool_output: str
     tool_outputs_by_name: dict[str, str]
     iterations: int
+    orchestrator_model: str
 
 
 # ---------------------------------------------------------------------------
@@ -67,17 +91,47 @@ class AgentState(TypedDict):
 # ---------------------------------------------------------------------------
 
 
-def _make_llm(*, bind_tools: bool = False) -> ChatOpenAI:
-    """Instantiate a GPT-4o ChatOpenAI client.
+def _make_llm(
+    *, bind_tools: bool = False, model_key: str = DEFAULT_ORCHESTRATOR_MODEL
+) -> BaseChatModel:
+    """Instantiate the orchestrator chat model.
+
+    Supports two providers selected by ``model_key``:
+
+    * ``"gpt-4o"``    — ``ChatOpenAI`` (uses OPENAI_API_KEY).
+    * ``"qwen3-32b"`` — ``ChatBedrockConverse`` from ``langchain-aws`` calling
+      the Bedrock Converse API (uses standard AWS creds + ``AWS_DEFAULT_REGION``).
+      Qwen on Bedrock supports tool use via Converse, so ``bind_tools`` works.
+
+    Falls back to GPT-4o if an unknown key is supplied.
 
     Args:
-        bind_tools: When True, attaches the full TOOLS list to the model so it
-            can emit structured tool-call requests.
+        bind_tools: When True, attaches the full TOOLS list so the model can
+            emit structured tool-call requests.
+        model_key: Logical model name (key in ``ORCHESTRATOR_MODELS``).
 
     Returns:
-        A (possibly tool-bound) ChatOpenAI instance.
+        A (possibly tool-bound) chat model.
     """
-    llm: ChatOpenAI = ChatOpenAI(model="gpt-4o", temperature=0)
+    cfg = ORCHESTRATOR_MODELS.get(model_key) or ORCHESTRATOR_MODELS[DEFAULT_ORCHESTRATOR_MODEL]
+    provider = cfg["provider"]
+    model_id = cfg["model_id"]
+
+    llm: BaseChatModel
+    if provider == "bedrock":
+        # Imported lazily so the API can boot even if langchain-aws is missing
+        # (the OpenAI path still works in that case).
+        from langchain_aws import ChatBedrockConverse  # type: ignore
+
+        region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+        llm = ChatBedrockConverse(
+            model=model_id,
+            temperature=0,
+            region_name=region,
+        )
+    else:
+        llm = ChatOpenAI(model=model_id, temperature=0)
+
     if bind_tools:
         return llm.bind_tools(TOOLS)
     return llm
@@ -88,8 +142,80 @@ def _make_llm(*, bind_tools: bool = False) -> ChatOpenAI:
 # ---------------------------------------------------------------------------
 
 
+def _content_to_text(content: Any) -> str:
+    """Collapse a LangChain message ``content`` value to a plain string.
+
+    ``ChatBedrockConverse`` returns ``AIMessage.content`` as a list of content
+    blocks (e.g. ``[{"type": "text", "text": "..."}, {"type": "tool_use", ...}]``).
+    When that AIMessage is later re-sent as part of the conversation, some
+    blocks can be mis-classified as image blocks, causing Qwen on Bedrock to
+    reject the request. We avoid that by flattening every message's content
+    to text-only before invoking a Bedrock orchestrator.
+
+    Args:
+        content: ``str`` or list of content-block dicts.
+
+    Returns:
+        Plain text representation. Non-text blocks (tool_use, image, etc.)
+        are dropped — their semantics are preserved separately via
+        ``AIMessage.tool_calls`` / ``ToolMessage`` records.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+                # Silently drop tool_use / image / other block types.
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content) if content is not None else ""
+
+
+def _normalise_messages_for_bedrock(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Return a copy of ``messages`` with all content fields collapsed to text.
+
+    Preserves ``tool_calls`` / ``tool_call_id`` / role so the conversation
+    remains valid for Bedrock's Converse API.
+
+    Args:
+        messages: Original conversation messages.
+
+    Returns:
+        New list of messages with string content.
+    """
+    cleaned: list[BaseMessage] = []
+    for m in messages:
+        new_content = _content_to_text(m.content)
+        if isinstance(m, AIMessage):
+            cleaned.append(
+                AIMessage(
+                    content=new_content,
+                    tool_calls=list(getattr(m, "tool_calls", []) or []),
+                    additional_kwargs=dict(getattr(m, "additional_kwargs", {}) or {}),
+                    id=getattr(m, "id", None),
+                )
+            )
+        elif isinstance(m, ToolMessage):
+            cleaned.append(
+                ToolMessage(
+                    content=new_content,
+                    tool_call_id=m.tool_call_id,
+                    name=getattr(m, "name", None),
+                )
+            )
+        else:
+            # HumanMessage / SystemMessage / etc. — clone with text content.
+            clone = m.model_copy(update={"content": new_content})
+            cleaned.append(clone)
+    return cleaned
+
+
 async def orchestrator_node(state: AgentState) -> dict:
-    """GPT-4o orchestrator.
+    """Orchestrator LLM step.
 
     On the first call, decides which tool to invoke (if any).
     On subsequent calls (after tool results are in the conversation), it
@@ -103,12 +229,25 @@ async def orchestrator_node(state: AgentState) -> dict:
         Partial state update with the orchestrator's AIMessage appended.
     """
     iters = state.get("iterations", 0)
+    model_key = state.get("orchestrator_model") or DEFAULT_ORCHESTRATOR_MODEL
     logger.info(
-        "orchestrator_node | iterations=%d message_count=%d",
-        iters, len(state["messages"]),
+        "orchestrator_node | model=%s iterations=%d message_count=%d",
+        model_key, iters, len(state["messages"]),
     )
-    llm = _make_llm(bind_tools=True)
-    response: AIMessage = await llm.ainvoke(state["messages"])
+    llm = _make_llm(bind_tools=True, model_key=model_key)
+
+    # Bedrock's Converse API is strict about content-block types. Flatten any
+    # list-of-blocks content to plain text before invocation so list-content
+    # AIMessages produced by a previous Bedrock turn cannot be mis-classified
+    # as image blocks on replay.
+    provider = ORCHESTRATOR_MODELS.get(model_key, {}).get("provider")
+    msgs = (
+        _normalise_messages_for_bedrock(state["messages"])
+        if provider == "bedrock"
+        else state["messages"]
+    )
+
+    response: AIMessage = await llm.ainvoke(msgs)
     logger.info(
         "orchestrator_node | tool_calls=%s",
         [tc["name"] for tc in (response.tool_calls or [])],
