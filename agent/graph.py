@@ -17,6 +17,7 @@ Nodes
 
 import logging
 import os
+import uuid
 from typing import Annotated, Any, Literal, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -56,6 +57,41 @@ ORCHESTRATOR_MODELS: dict[str, dict[str, str]] = {
 }
 DEFAULT_ORCHESTRATOR_MODEL: str = "qwen3-32b"
 
+MEDICAL_TOOL_NAMES: set[str] = {
+    "medical_qa",
+    "retfound_analyze",
+    "endofm_analyze",
+    "sam_med2d_segment",
+    "totalsegmentator_segment",
+}
+
+SPECIALIST_MEDICAL_TOOL_NAMES: set[str] = MEDICAL_TOOL_NAMES - {"medical_qa"}
+
+MEDICAL_ROUTING_KEYWORDS: tuple[str, ...] = (
+    "medical", "health", "clinical", "patient", "doctor", "hospital",
+    "symptom", "symptoms", "diagnosis", "disease", "treatment", "medicine",
+    "medication", "drug", "dose", "dosage", "pain", "fever", "injury",
+
+    # Emergency / symptom text queries that must never be answered directly by Qwen.
+    "breathing", "breath", "breathless", "breathlessness",
+    "difficulty breathing", "trouble breathing", "trouble in breathing",
+    "breathing trouble", "hard to breathe", "can't breathe", "cannot breathe",
+    "short of breath", "shortness of breath", "chest pain", "chest discomfort",
+    "chest tightness", "heart attack", "stroke", "seizure", "fainting",
+    "dizziness", "unconscious", "loss of consciousness",
+    "jaw pain", "neck pain", "arm pain", "sweating", "nausea",
+
+    "scan", "xray", "x-ray", "mri", "ct", "ultrasound", "dicom",
+    "nifti", "nii", "retina", "retinal", "fundus", "oct", "glaucoma",
+    "diabetic retinopathy", "diabetes", "bp", "blood pressure",
+    "hypertension", "infection", "cancer", "asthma", "pregnancy",
+    "endoscopy", "colonoscopy", "capsule", "polyp", "lesion",
+    "tumor", "tumour", "organ", "vessel", "segmentation", "mask",
+    "sam-med2d", "totalsegmentator", "retfound", "endo-fm", "medgemma",
+    "chest", "lung", "heart", "liver", "aorta", "femur", "ventricle",
+    "radiology", "pathology",
+)
+
 
 # ---------------------------------------------------------------------------
 # State schema
@@ -69,7 +105,10 @@ class AgentState(TypedDict):
         messages: Full conversation history (managed by LangGraph add_messages).
         tool_used: Name of the LAST tool invoked (empty string if none).
         tools_chain: Ordered list of tool names invoked across the request.
-        image_base64: Base64-encoded image supplied by the user (may be empty).
+        image_base64: First base64-encoded image supplied by the user (may be empty).
+        image_base64_list: Up to 10 base64-encoded images for multi-file routing.
+        uploaded_files: Uploaded file metadata and S3 references.
+        file_context: Text/metadata extracted from uploaded files for routing.
         tool_output: Raw string output from the last tool call.
         tool_outputs_by_name: Per-tool latest raw output (for downstream
             consumers such as bounding-box drawing).
@@ -80,6 +119,10 @@ class AgentState(TypedDict):
     tool_used: str
     tools_chain: list[str]
     image_base64: Optional[str]
+    image_base64_list: list[str]
+    uploaded_files: list[dict[str, Any]]
+    file_context: str
+    request_id: str
     tool_output: str
     tool_outputs_by_name: dict[str, str]
     iterations: int
@@ -214,6 +257,91 @@ def _normalise_messages_for_bedrock(messages: list[BaseMessage]) -> list[BaseMes
     return cleaned
 
 
+def _latest_human_text(messages: list[BaseMessage]) -> str:
+    """Return the latest user-facing HumanMessage text from graph state."""
+    for msg in reversed(messages):
+        if getattr(msg, "type", "") == "human":
+            return _content_to_text(msg.content)
+    return ""
+
+
+def _combined_medical_routing_text(state: AgentState) -> str:
+    """Build a deterministic text bundle used only for medical fallback routing."""
+    latest_user_text = _latest_human_text(state.get("messages", []))
+    filenames = " ".join(
+        str(ref.get("filename") or ref.get("name") or "")
+        for ref in (state.get("uploaded_files") or [])
+    )
+    file_context = state.get("file_context") or ""
+    return f"{latest_user_text}\n{filenames}\n{file_context}".lower()
+
+
+def _looks_like_medical_request(state: AgentState) -> bool:
+    """Return True when the user request should never be answered directly by the orchestrator."""
+    if any(tool in MEDICAL_TOOL_NAMES for tool in (state.get("tools_chain") or [])):
+        return True
+
+    combined = _combined_medical_routing_text(state)
+    return any(keyword in combined for keyword in MEDICAL_ROUTING_KEYWORDS)
+
+
+def _select_medical_tool_forced(state: AgentState) -> str:
+    """Deterministically choose the first medical tool when the orchestrator did not call one."""
+    chain = state.get("tools_chain") or []
+
+    # If a specialist medical model already ran, force MedGemma as the final medical explainer.
+    if any(tool in SPECIALIST_MEDICAL_TOOL_NAMES for tool in chain) and "medical_qa" not in chain:
+        return "medical_qa"
+
+    combined = _combined_medical_routing_text(state)
+
+    if any(x in combined for x in ("ct.nii", ".nii.gz", "nifti", "dicom", "3d ct", "3d mr", "totalsegmentator")):
+        return "totalsegmentator_segment"
+
+    if any(x in combined for x in ("sam-med2d", "segment", "segmentation", "mask", "bbox", "lesion", "tumor", "tumour", "organ", "vessel", "aorta", "liver", "femur", "ventricle")):
+        return "sam_med2d_segment"
+
+    if any(x in combined for x in ("retfound", "fundus", "retina", "retinal", "oct", "glaucoma", "diabetic retinopathy", "npdr", "pdr", "paraguay")):
+        return "retfound_analyze"
+
+    if any(x in combined for x in ("endo", "endoscopy", "colonoscopy", "capsule", "polyp", "kvasir")):
+        return "endofm_analyze"
+
+    # Simple medical text question or general medical image question.
+    return "medical_qa"
+
+
+def _forced_medical_tool_call_message(state: AgentState, tool_name: str) -> AIMessage:
+    """Create a synthetic tool-call AIMessage so medical requests cannot end as direct Qwen answers."""
+    user_text = _latest_human_text(state.get("messages", [])) or "Answer the medical question."
+    args: dict[str, Any] = {"query": user_text}
+
+    if tool_name == "medical_qa":
+        specialist_context = []
+        for name, output in (state.get("tool_outputs_by_name") or {}).items():
+            if name in SPECIALIST_MEDICAL_TOOL_NAMES:
+                specialist_context.append(f"{name} output:\n{output}")
+
+        if specialist_context:
+            args["query"] = (
+                f"User question:\n{user_text}\n\n"
+                "Use the specialist medical model output below as intermediate research features. "
+                "Generate the final user-facing medical explanation with safety limitations.\n\n"
+                + "\n\n".join(specialist_context)
+            )
+
+    tool_call = {
+        "name": tool_name,
+        "args": args,
+        "id": f"forced_medical_{uuid.uuid4().hex[:12]}",
+    }
+
+    return AIMessage(
+        content=f"Routing medical request to {tool_name}; the orchestrator will not answer directly.",
+        tool_calls=[tool_call],
+    )
+
+
 async def orchestrator_node(state: AgentState) -> dict:
     """Orchestrator LLM step.
 
@@ -248,10 +376,20 @@ async def orchestrator_node(state: AgentState) -> dict:
     )
 
     response: AIMessage = await llm.ainvoke(msgs)
+
+    if not (response.tool_calls or []) and _looks_like_medical_request(state):
+        forced_tool_name = _select_medical_tool_forced(state)
+        logger.info(
+            "orchestrator_node | forcing medical tool=%s because orchestrator produced direct answer",
+            forced_tool_name,
+        )
+        response = _forced_medical_tool_call_message(state, forced_tool_name)
+
     logger.info(
         "orchestrator_node | tool_calls=%s",
         [tc["name"] for tc in (response.tool_calls or [])],
     )
+
     return {"messages": [response]}
 
 
@@ -287,19 +425,63 @@ async def tool_executor_node(state: AgentState) -> dict:
         tool_used = tool_name
         chain_addition.append(tool_name)
 
-        # GPT-4o cannot pass large binary data in tool call arguments — it either
-        # omits image_base64 entirely or substitutes a short placeholder string
-        # (e.g. "<base64+encoded+image>"). Always inject the real bytes from
-        # state for any vision / detection tool.
-        vision_tools = {"vision_llm", "object_detection"}
-        if tool_name in vision_tools:
-            real_image = state.get("image_base64") or ""
-            if real_image:
-                tool_args["image_base64"] = real_image
-                logger.info(
-                    "tool_executor_node | injected image_base64 from state (len=%d)",
-                    len(real_image),
-                )
+        # The orchestrator receives only safe text/metadata. Real image bytes,
+        # extracted file context, and verified S3 references are injected here
+        # so tool-call arguments stay small and cannot be hallucinated by the LLM.
+        image_list = state.get("image_base64_list") or []
+        first_image = state.get("image_base64") or (image_list[0] if image_list else "")
+        file_context = state.get("file_context") or ""
+        uploaded_files = state.get("uploaded_files") or []
+        request_id = state.get("request_id") or ""
+
+        if tool_name == "vision_llm":
+            if first_image:
+                tool_args["image_base64"] = first_image
+            if image_list:
+                tool_args["image_base64_list"] = image_list
+            if file_context:
+                tool_args["file_context"] = file_context
+            logger.info(
+                "tool_executor_node | injected %d image(s) and file_context=%s",
+                len(image_list),
+                bool(file_context),
+            )
+        elif tool_name == "medical_qa":
+            if first_image:
+                tool_args["image_base64"] = first_image
+            if image_list:
+                tool_args["image_base64_list"] = image_list
+            if uploaded_files:
+                tool_args["uploaded_files"] = uploaded_files
+            if file_context:
+                tool_args["file_context"] = file_context
+            logger.info(
+                "tool_executor_node | injected medical context: images=%d files=%d file_context=%s",
+                len(image_list),
+                len(uploaded_files),
+                bool(file_context),
+            )
+        elif tool_name in {"retfound_analyze", "endofm_analyze", "sam_med2d_segment", "totalsegmentator_segment"}:
+            if uploaded_files:
+                tool_args["uploaded_files"] = uploaded_files
+            if file_context:
+                tool_args["file_context"] = file_context
+            if request_id:
+                tool_args["request_id"] = request_id
+            logger.info(
+                "tool_executor_node | injected specialist context: tool=%s files=%d file_context=%s",
+                tool_name,
+                len(uploaded_files),
+                bool(file_context),
+            )
+        elif tool_name == "object_detection" and first_image:
+            # Object-detection annotation is currently generated for the first
+            # image. Extend this to per-file detection outputs when needed.
+            tool_args["image_base64"] = first_image
+            logger.info(
+                "tool_executor_node | injected first image_base64 from state (len=%d)",
+                len(first_image),
+            )
 
         logger.info(
             "tool_executor_node | tool=%s args_keys=%s",
@@ -369,6 +551,20 @@ def _route_after_orchestrator(
     return END
 
 
+def _route_after_tool_executor(
+    state: AgentState,
+) -> Literal["orchestrator", "__end__"]:
+    """End immediately after terminal tools so the orchestrator does not cross-route incorrectly."""
+    tools_chain = state.get("tools_chain") or []
+    latest_tool = tools_chain[-1] if tools_chain else ""
+
+    if latest_tool in {"medical_qa", "legal_qa", "object_detection"}:
+        logger.info("_route_after_tool_executor | %s completed — ending graph", latest_tool)
+        return END
+
+    return "orchestrator"
+
+
 # ---------------------------------------------------------------------------
 # Graph construction
 # ---------------------------------------------------------------------------
@@ -392,9 +588,14 @@ def build_graph():
         _route_after_orchestrator,
         {"tool_executor": "tool_executor", END: END},
     )
-    # Loop back so the orchestrator can chain another tool or synthesise the
-    # final answer once it has tool results.
-    graph.add_edge("tool_executor", "orchestrator")
+    
+    # For medical requests, stop after MedGemma so the final answer is the medical model output,
+    # not a Qwen/GPT rewrite. For non-medical tools, keep the existing synthesis loop.
+    graph.add_conditional_edges(
+        "tool_executor",
+        _route_after_tool_executor,
+        {"orchestrator": "orchestrator", END: END},
+    )
 
     logger.info("build_graph | graph compiled successfully (ReAct loop)")
     return graph.compile()

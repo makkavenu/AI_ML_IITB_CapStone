@@ -1,0 +1,54 @@
+services:
+  api:
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ap-south-1
+        awslogs-group: /ai-agent-demo/api
+        awslogs-stream: api
+        awslogs-create-group: "true"
+
+  ui:
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ap-south-1
+        awslogs-group: /ai-agent-demo/ui
+        awslogs-stream: ui
+        awslogs-create-group: "true"
+
+  prometheus:
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ap-south-1
+        awslogs-group: /ai-agent-demo/prometheus
+        awslogs-stream: prometheus
+        awslogs-create-group: "true"
+
+  grafana:
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ap-south-1
+        awslogs-group: /ai-agent-demo/grafana
+        awslogs-stream: grafana
+        awslogs-create-group: "true"
+
+  node-exporter:
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ap-south-1
+        awslogs-group: /ai-agent-demo/node-exporter
+        awslogs-stream: node-exporter
+        awslogs-create-group: "true"
+
+  cadvisor:
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ap-south-1
+        awslogs-group: /ai-agent-demo/cadvisor
+        awslogs-stream: cadvisor
+        awslogs-create-group: "true"

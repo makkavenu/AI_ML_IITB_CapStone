@@ -1,0 +1,208 @@
+{
+  "id": null,
+  "uid": "ai-agent-overview",
+  "title": "AI Agent Overview",
+  "tags": [
+    "ai-agent",
+    "fastapi",
+    "docker"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Chat Requests",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(ai_agent_chat_requests_total)",
+          "legendFormat": "requests"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Guardrail Blocks",
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(ai_agent_guardrail_blocked_total)",
+          "legendFormat": "blocked"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Presigned Upload Files",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(ai_agent_file_presign_files_total)",
+          "legendFormat": "files"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Failed Requests",
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(ai_agent_chat_request_status_total{status=\"FAILED\"})",
+          "legendFormat": "failed"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "FastAPI HTTP Requests / Second",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total[5m]))",
+          "legendFormat": "requests/sec"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "AI Agent Worker Duration P95",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ai_agent_chat_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95 seconds"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tool Routing Selections",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (tool) (increase(ai_agent_tool_selection_total[10m]))",
+          "legendFormat": "{{tool}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Container Memory Usage",
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (name) (container_memory_usage_bytes{name=~\".*api.*|.*ui.*|.*prometheus.*|.*grafana.*\"})",
+          "legendFormat": "{{name}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "EC2 CPU Usage",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "100 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100",
+          "legendFormat": "CPU %"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "EC2 Disk Available",
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "node_filesystem_avail_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"}",
+          "legendFormat": "available bytes"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis Cache Hits / Misses",
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (event) (increase(ai_agent_cache_events_total{event=~\"hit|miss|set|error|disabled\"}[10m]))",
+          "legendFormat": "{{event}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis Cache Operation P95",
+      "gridPos": {
+        "x": 12,
+        "y": 28,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ai_agent_cache_operation_duration_seconds_bucket[5m])) by (operation, le))",
+          "legendFormat": "{{operation}} p95"
+        }
+      ]
+    }
+  ]
+}

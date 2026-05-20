@@ -147,7 +147,9 @@ def ask_bedrock_qwen(
                     "content": (
                         "You are a legal assistant specialising in Indian law. "
                         "Answer ONLY based on the provided legal Q&A context. "
-                        "Cite the source (IPC / CrPC / Constitution) for each point."
+                        "Cite legal provisions (of (IPC / CrPC / Constitution) by their actual names, such as Section 302 IPC, "
+                        "Section 420 IPC, Article 21 of the Constitution, etc. "
+                        "Do not output bracketed retrieval labels like [Source 1], [Source 2], or [Source 4]."
                     ),
                 },
                 {

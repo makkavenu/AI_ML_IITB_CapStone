@@ -14,9 +14,18 @@ httpx>=0.27.0
 
 # Image processing — bounding-box drawing for object detection
 Pillow>=10.0.0
+numpy>=1.26.0
 
 # Legal RAG (legal_qa tool)
 openai>=1.30.0
 pinecone>=5.0.0
 boto3>=1.34.0
 python-dotenv>=1.0.0
+pypdf>=4.2.0
+
+prometheus-fastapi-instrumentator>=7.0.0
+
+prometheus-client>=0.20.0
+
+# Redis response cache
+redis>=5.0.0

@@ -11,8 +11,12 @@ from typing import AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.routers.chat import router as chat_router
+from app.routers.uploads import router as uploads_router
+from app.routers.sam_med2d import router as sam_med2d_router
+from app.routers.retfound import router as retfound_router
 
 # ---------------------------------------------------------------------------
 # Logging — structured, stdout, suitable for Docker log collection
@@ -72,7 +76,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Expose Prometheus-compatible metrics at /metrics. Prometheus scrapes this
+# endpoint through the Docker network; do not expose it publicly in EC2
+# security groups.
+Instrumentator(
+    should_group_status_codes=True,
+    should_ignore_untemplated=True,
+    excluded_handlers=["/health", "/metrics"],
+).instrument(app).expose(
+    app,
+    endpoint="/metrics",
+    include_in_schema=False,
+)
+
 app.include_router(chat_router, prefix="/api")
+app.include_router(uploads_router, prefix="/api", tags=["uploads"])
+app.include_router(sam_med2d_router, prefix="/api/sam-med2d", tags=["sam-med2d"])
+app.include_router(retfound_router, prefix="/api/retfound", tags=["retfound"])
 
 
 # ---------------------------------------------------------------------------
