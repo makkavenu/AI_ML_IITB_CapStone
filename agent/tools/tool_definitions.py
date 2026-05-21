@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Optional
 
@@ -37,6 +38,51 @@ _MEDGEMMA_URL: str = os.getenv(
 _QWEN_VL_URL: str = os.getenv(
     "QWEN_VL_ENDPOINT_URL", "http://137.74.88.197:8001"
 ).rstrip("/") + "/v1/chat/completions"
+
+# Bedrock vision model — Qwen3-VL-235B served by AWS Bedrock Converse API.
+# The exact model id is shown in the Bedrock playground "View API request"
+# panel. As of May 2026 it is ``qwen.qwen3-vl-235b-a22b`` (no version suffix,
+# no geo prefix) served from ``us-west-2``.
+_QWEN_VL_BEDROCK_MODEL_ID: str = os.getenv(
+    "QWEN_VL_BEDROCK_MODEL_ID", "qwen.qwen3-vl-235b-a22b"
+)
+# Region for the vision model — defaults to us-west-2 where Qwen3-VL is
+# currently available. Independent of AWS_DEFAULT_REGION used by legal_qa.
+_QWEN_VL_BEDROCK_REGION: str = os.getenv(
+    "QWEN_VL_BEDROCK_REGION",
+    os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
+)
+# Max pixel dimension sent to Bedrock — keeps payload size predictable and
+# well under the per-image limit for the Converse API.
+_VISION_MAX_DIM: int = int(os.getenv("VISION_MAX_DIM", "1280"))
+# Cap on the number of images sent in a single Converse call.
+_VISION_MAX_IMAGES_PER_CALL: int = int(os.getenv("VISION_MAX_IMAGES_PER_CALL", "4"))
+
+# Lazy-built boto3 Bedrock client for the vision model (reused across calls).
+_VISION_BEDROCK_CLIENT = None
+_VISION_BEDROCK_CLIENT_LOCK = threading.Lock()
+
+
+def _get_vision_bedrock_client():
+    """Build (once) and return the boto3 ``bedrock-runtime`` client for the
+    Qwen3-VL vision model, pinned to ``QWEN_VL_BEDROCK_REGION``.
+    """
+    global _VISION_BEDROCK_CLIENT
+    if _VISION_BEDROCK_CLIENT is not None:
+        return _VISION_BEDROCK_CLIENT
+    with _VISION_BEDROCK_CLIENT_LOCK:
+        if _VISION_BEDROCK_CLIENT is not None:
+            return _VISION_BEDROCK_CLIENT
+        import boto3  # local import keeps the module light if unused
+
+        _VISION_BEDROCK_CLIENT = boto3.client(
+            "bedrock-runtime", region_name=_QWEN_VL_BEDROCK_REGION
+        )
+        logger.info(
+            "_get_vision_bedrock_client | initialised region=%s model=%s",
+            _QWEN_VL_BEDROCK_REGION, _QWEN_VL_BEDROCK_MODEL_ID,
+        )
+        return _VISION_BEDROCK_CLIENT
 
 _YOLOV12_URL: str = os.getenv(
     "YOLOV12_ENDPOINT_URL", "http://137.74.88.197:8002"
@@ -247,6 +293,57 @@ def _b64_to_image_bytes(image_base64: str) -> bytes:
     raw = "".join(raw.split()).replace("-", "+").replace("_", "/")
     raw += "=" * (-len(raw) % 4)
     return _base64.b64decode(raw, validate=True)
+
+
+def _b64_to_bedrock_image_block(image_base64: str) -> dict[str, Any] | None:
+    """Decode a base64 image and return a Bedrock Converse image content block.
+
+    Detects the image format with Pillow (jpeg/png/gif/webp), re-encodes to JPEG
+    if the format is unknown, and downscales to ``_VISION_MAX_DIM`` to keep the
+    Converse payload well under the per-image size limit.
+
+    Returns ``None`` if the input cannot be decoded.
+    """
+    try:
+        img_bytes = _b64_to_image_bytes(image_base64)
+    except Exception:
+        logger.exception("_b64_to_bedrock_image_block | base64 decode failed")
+        return None
+
+    try:
+        pil_img = Image.open(io.BytesIO(img_bytes))
+        pil_format = (pil_img.format or "").upper()
+        if pil_format == "JPEG":
+            fmt = "jpeg"
+        elif pil_format == "PNG":
+            fmt = "png"
+        elif pil_format == "GIF":
+            fmt = "gif"
+        elif pil_format == "WEBP":
+            fmt = "webp"
+        else:
+            pil_img = pil_img.convert("RGB")
+            fmt = "jpeg"
+
+        w, h = pil_img.size
+        if max(w, h) > _VISION_MAX_DIM:
+            scale = _VISION_MAX_DIM / max(w, h)
+            pil_img = pil_img.resize(
+                (int(w * scale), int(h * scale)), Image.LANCZOS
+            )
+            buf = io.BytesIO()
+            if fmt == "jpeg":
+                pil_img.convert("RGB").save(buf, format="JPEG", quality=90)
+            else:
+                pil_img.save(buf, format=fmt.upper())
+            img_bytes = buf.getvalue()
+    except Exception:
+        logger.exception(
+            "_b64_to_bedrock_image_block | normalise failed — sending as JPEG"
+        )
+        fmt = "jpeg"
+
+    return {"image": {"format": fmt, "source": {"bytes": img_bytes}}}
 
 
 def _embedding_summary(data: dict[str, Any]) -> dict[str, Any]:
@@ -712,11 +809,19 @@ async def vision_llm(
     image_base64_list: list[str] | None = None,
     file_context: str = "",
 ) -> str:
-    """Analyse one or more images/files with the Qwen-VL endpoint."""
+    """Analyse one or more images/files with the Qwen3-VL-235B model on AWS Bedrock.
+
+    Uses the AWS Bedrock ``Converse`` API with the model id
+    ``QWEN_VL_BEDROCK_MODEL_ID`` (default: ``qwen.qwen3-vl-235b-a22b``) in
+    region ``QWEN_VL_BEDROCK_REGION`` (default: ``us-west-2``). The blocking
+    boto3 call is dispatched to a worker thread via ``asyncio.to_thread``.
+    """
+    import asyncio
+
     images = list(image_base64_list or [])
     if image_base64 and image_base64 not in images:
         images.insert(0, image_base64)
-    images = images[:_MAX_IMAGES_FOR_LLM]
+    images = images[:_VISION_MAX_IMAGES_PER_CALL]
 
     combined_query = query
     if file_context:
@@ -726,23 +831,53 @@ async def vision_llm(
             f"{file_context}"
         )
 
-    if images:
-        content: list[dict[str, Any]] | str = [{"type": "text", "text": combined_query}]
-        for img in images:
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
-    else:
-        content = combined_query
+    logger.info(
+        "vision_llm called | model=%s region=%s images=%d query[:120]=%r",
+        _QWEN_VL_BEDROCK_MODEL_ID, _QWEN_VL_BEDROCK_REGION,
+        len(images), (combined_query or "")[:120],
+    )
 
-    payload = {
-        "model": "Qwen/Qwen3-VL-2B-Instruct",
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 768,
-    }
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-        resp = await client.post(_QWEN_VL_URL, json=payload)
-        resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    # Build content blocks: leading text, then each image (skipping any that
+    # fail to decode so a single bad attachment doesn't kill the whole call).
+    content_blocks: list[dict[str, Any]] = [
+        {"text": combined_query or "Describe the attached image(s)."}
+    ]
+    for img_b64 in images:
+        block = _b64_to_bedrock_image_block(img_b64)
+        if block is not None:
+            content_blocks.append(block)
+
+    def _invoke_bedrock_vision() -> str:
+        client = _get_vision_bedrock_client()
+        response = client.converse(
+            modelId=_QWEN_VL_BEDROCK_MODEL_ID,
+            messages=[{"role": "user", "content": content_blocks}],
+            inferenceConfig={"maxTokens": 768, "temperature": 0.2},
+        )
+        blocks = (
+            response.get("output", {}).get("message", {}).get("content", []) or []
+        )
+        parts: list[str] = [
+            b["text"] for b in blocks
+            if isinstance(b, dict) and isinstance(b.get("text"), str)
+        ]
+        answer = "".join(parts).strip()
+        logger.info(
+            "vision_llm | usage=%s response_chars=%d",
+            response.get("usage"), len(answer),
+        )
+        return answer or "The vision model returned an empty response."
+
+    try:
+        return await asyncio.to_thread(_invoke_bedrock_vision)
+    except Exception as exc:
+        logger.exception("vision_llm | Bedrock Converse call failed")
+        return (
+            "The vision model on AWS Bedrock encountered an error processing "
+            f"the request (model={_QWEN_VL_BEDROCK_MODEL_ID}, "
+            f"region={_QWEN_VL_BEDROCK_REGION}). "
+            f"Details: {type(exc).__name__}: {exc}"
+        )
 
 
 # ---------------------------------------------------------------------------

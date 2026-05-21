@@ -44,7 +44,7 @@ _TOOL_ICONS: dict[str, str] = {
 }
 
 _ORCHESTRATOR_MODEL_OPTIONS: list[dict[str, str]] = [
-    {"key": "qwen3-32b", "label": "Qwen3-32B"},
+    {"key": "qwen3-vl-235b", "label": "Qwen3-VL-235B"},
     {"key": "gpt-4o", "label": "GPT-4o"},
 ]
 _DEFAULT_ORCHESTRATOR_MODEL_KEY: str = _ORCHESTRATOR_MODEL_OPTIONS[0]["key"]

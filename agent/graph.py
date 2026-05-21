@@ -49,13 +49,21 @@ ORCHESTRATOR_MODELS: dict[str, dict[str, str]] = {
         "model_id": "gpt-4o",
         "label": "GPT-4o (OpenAI)",
     },
-    "qwen3-32b": {
+    "qwen3-vl-235b": {
         "provider": "bedrock",
-        "model_id": "qwen.qwen3-32b-v1:0",
-        "label": "Qwen3-32B (AWS Bedrock)",
+        "model_id": os.getenv(
+            "QWEN_VL_BEDROCK_MODEL_ID", "qwen.qwen3-vl-235b-a22b"
+        ),
+        # Qwen3-VL is currently served from us-west-2. Override with
+        # QWEN_VL_BEDROCK_REGION if AWS adds more regions.
+        "region": os.getenv(
+            "QWEN_VL_BEDROCK_REGION",
+            os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
+        ),
+        "label": "Qwen3-VL-235B (AWS Bedrock)",
     },
 }
-DEFAULT_ORCHESTRATOR_MODEL: str = "qwen3-32b"
+DEFAULT_ORCHESTRATOR_MODEL: str = "qwen3-vl-235b"
 
 MEDICAL_TOOL_NAMES: set[str] = {
     "medical_qa",
@@ -141,10 +149,11 @@ def _make_llm(
 
     Supports two providers selected by ``model_key``:
 
-    * ``"gpt-4o"``    — ``ChatOpenAI`` (uses OPENAI_API_KEY).
-    * ``"qwen3-32b"`` — ``ChatBedrockConverse`` from ``langchain-aws`` calling
-      the Bedrock Converse API (uses standard AWS creds + ``AWS_DEFAULT_REGION``).
-      Qwen on Bedrock supports tool use via Converse, so ``bind_tools`` works.
+    * ``"gpt-4o"``         — ``ChatOpenAI`` (uses OPENAI_API_KEY).
+    * ``"qwen3-vl-235b"`` — ``ChatBedrockConverse`` from ``langchain-aws``
+      calling the Bedrock Converse API for Qwen3-VL-235B (multi-modal). Uses
+      standard AWS creds; region defaults to ``us-west-2`` (overridable via
+      ``QWEN_VL_BEDROCK_REGION``).
 
     Falls back to GPT-4o if an unknown key is supplied.
 
@@ -166,7 +175,10 @@ def _make_llm(
         # (the OpenAI path still works in that case).
         from langchain_aws import ChatBedrockConverse  # type: ignore
 
-        region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+        # Each Bedrock entry may pin its own region (some models like Qwen3-VL
+        # are only available in specific regions). Fall back to the global
+        # default if the entry doesn't specify one.
+        region = cfg.get("region") or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
         llm = ChatBedrockConverse(
             model=model_id,
             temperature=0,
@@ -551,15 +563,45 @@ def _route_after_orchestrator(
     return END
 
 
+_LEGAL_ROUTING_KEYWORDS: tuple[str, ...] = (
+    "legal", "law", "ipc", "crpc", "bnss", "bns", "fir", "bail", "court",
+    "judgment", "judgement", "contract", "notice", "statute", "section",
+    "act ", " act", "rights", "regulation", "compliance", "petition",
+    "affidavit", "advocate", "lawyer", "constitution", "article ",
+)
+
+
 def _route_after_tool_executor(
     state: AgentState,
 ) -> Literal["orchestrator", "__end__"]:
-    """End immediately after terminal tools so the orchestrator does not cross-route incorrectly."""
+    """End immediately after terminal tools so the orchestrator does not cross-route incorrectly.
+
+    vision_llm is terminal for ALL non-legal requests.  For legal-document
+    image flows (vision_llm → legal_qa) the orchestrator gets one more turn
+    only when the user message contains legal keywords AND legal_qa has not
+    yet run in this chain.
+    """
     tools_chain = state.get("tools_chain") or []
     latest_tool = tools_chain[-1] if tools_chain else ""
 
     if latest_tool in {"medical_qa", "legal_qa", "object_detection"}:
         logger.info("_route_after_tool_executor | %s completed — ending graph", latest_tool)
+        return END
+
+    if latest_tool == "vision_llm":
+        # Allow one more orchestrator turn ONLY for legal-document chaining
+        # when legal_qa hasn't run yet.
+        if "legal_qa" not in tools_chain:
+            combined = _combined_medical_routing_text(state)
+            if any(kw in combined for kw in _LEGAL_ROUTING_KEYWORDS):
+                logger.info(
+                    "_route_after_tool_executor | vision_llm done, legal doc detected — "
+                    "continuing to orchestrator for legal_qa"
+                )
+                return "orchestrator"
+        logger.info(
+            "_route_after_tool_executor | vision_llm completed (non-legal) — ending graph"
+        )
         return END
 
     return "orchestrator"
